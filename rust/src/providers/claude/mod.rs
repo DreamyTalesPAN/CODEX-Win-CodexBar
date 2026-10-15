@@ -968,12 +968,6 @@ impl ClaudeProvider {
             return Ok(result);
         }
 
-        if let Some(result) =
-            record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
-        {
-            return Ok(result);
-        }
-
         // Upstream 0.50.1 #2516: track whether OAuth failed with a revocation.
         let oauth_result = self.fetch_via_oauth(ctx).await;
         let oauth_revoked = oauth_result
@@ -992,6 +986,23 @@ impl ClaudeProvider {
             ));
         }
 
+        // The browser can be signed in to another claude.ai account than
+        // Claude Code (a second account in another browser), and its numbers
+        // then belong to that account. So while Claude Code is signed in, its
+        // login and its /usage screen answer first and the browser is only
+        // the last live source. Without a Claude Code login the CLI cannot
+        // answer either, so the browser keeps its place before it.
+        let claude_code_signed_in = oauth_rate_limited
+            || oauth_revoked
+            || ctx.api_key.as_deref().is_some_and(|t| !t.trim().is_empty())
+            || oauth::has_stored_credentials();
+        if !claude_code_signed_in
+            && let Some(result) =
+                record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
+        {
+            return Ok(result);
+        }
+
         // When OAuth was revoked (not just expired), reuse a cached CLI result
         // if still within the 15-minute TTL to avoid re-probing the CLI.
         if oauth_revoked && let Some(cached) = cached_cli_result_for_auto() {
@@ -1004,37 +1015,46 @@ impl ClaudeProvider {
         // it. Probe the CLI once and reuse that result for the cache TTL: its
         // /usage screen still shows session and weekly, so a first run with
         // nothing to preserve gets values instead of an error. After a failed
-        // probe, fail fast for a while: the rate-limit error keeps the last
+        // probe, skip it for a while: the rate-limit error keeps the last
         // good values on screen (LastGoodFailurePolicy::Preserve).
-        if oauth_rate_limited {
+        let skip_cli_probe = if oauth_rate_limited {
             if let Some(cached) = cached_cli_result_for_auto() {
                 return Ok(cached);
             }
-            if rate_limited_cli_probe_failed_recently() {
-                return Err(claude_auto_fetch_error(failures));
+            rate_limited_cli_probe_failed_recently()
+        } else {
+            false
+        };
+
+        if !skip_cli_probe {
+            let cli_result = self.fetch_via_cli(ctx).await;
+            if oauth_rate_limited {
+                note_rate_limited_cli_probe(cli_result.is_ok());
+            }
+            if let Some(mut result) = record_auto_source(&mut failures, "CLI", cli_result) {
+                // Without consent for reading Claude Code credentials, label the
+                // CLI fallback as reduced fidelity.
+                if !claude_code_consent() {
+                    result.source_label = "cli (reduced fidelity)".to_string();
+                }
+                // Cache the CLI result when OAuth was revoked or rate limited so polls
+                // within the TTL reuse it without re-probing.
+                if oauth_revoked || oauth_rate_limited {
+                    cache_cli_result(result.clone());
+                }
+                return Ok(steady_across_source_change(
+                    result,
+                    AUTO_SOURCE_CLI,
+                    Instant::now(),
+                ));
             }
         }
 
-        let cli_result = self.fetch_via_cli(ctx).await;
-        if oauth_rate_limited {
-            note_rate_limited_cli_probe(cli_result.is_ok());
-        }
-        if let Some(mut result) = record_auto_source(&mut failures, "CLI", cli_result) {
-            // Without consent for reading Claude Code credentials, label the
-            // CLI fallback as reduced fidelity.
-            if !claude_code_consent() {
-                result.source_label = "cli (reduced fidelity)".to_string();
-            }
-            // Cache the CLI result when OAuth was revoked or rate limited so polls
-            // within the TTL reuse it without re-probing.
-            if oauth_revoked || oauth_rate_limited {
-                cache_cli_result(result.clone());
-            }
-            return Ok(steady_across_source_change(
-                result,
-                AUTO_SOURCE_CLI,
-                Instant::now(),
-            ));
+        if claude_code_signed_in
+            && let Some(result) =
+                record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
+        {
+            return Ok(result);
         }
 
         // Upstream 0.50.1 #2516: when all live sources fail, keep the

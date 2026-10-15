@@ -155,6 +155,12 @@ pub(super) fn is_rate_limited_error(error: &ProviderError) -> bool {
     matches!(error, ProviderError::OAuth(message) if message.starts_with(RATE_LIMITED_PREFIX))
 }
 
+/// True when a Claude Code login is readable (environment token, credentials
+/// file or OS credential store), whether or not its access token is current.
+pub(super) fn has_stored_credentials() -> bool {
+    credentials_store::load_credentials().is_ok()
+}
+
 /// Claude OAuth fetcher
 pub struct ClaudeOAuthFetcher {
     client: Client,
