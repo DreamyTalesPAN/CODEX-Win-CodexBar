@@ -438,37 +438,7 @@ impl CostScanner {
 
     /// Scan Claude local logs, stopping early when the caller cancels the scan.
     pub fn scan_claude_with_cancel(&self, cancel: Option<&AtomicBool>) -> CostSummary {
-        let projects_dir = self.get_claude_projects_dir();
-        let mut summary = CostSummary::default();
-        let today = Utc::now().date_naive();
-        let start_date = today - Duration::days(self.days as i64);
-        let cutoff = Utc::now() - Duration::days(self.days as i64);
-
-        summary.period_start = Some(start_date);
-        summary.period_end = Some(today);
-
-        // Walk through projects directory, de-duplicating usage records
-        // that appear across multiple files.
-        if projects_dir.exists() {
-            let mut seen = HashSet::new();
-            let mut pricing = ClaudeScanPricingResolver::default();
-            let mut handle_file = |path: &Path| {
-                let counted = for_each_claude_usage_record_with_pricing(
-                    path,
-                    &cutoff,
-                    &mut seen,
-                    cancel,
-                    &mut pricing,
-                    |record| {
-                        add_claude_record_to_summary(&mut summary, record);
-                    },
-                );
-                if counted > 0 {
-                    summary.sessions_count += 1;
-                }
-            };
-            self.walk_claude_files(&projects_dir, &cutoff, cancel, &mut handle_file);
-        }
+        let mut summary = self.scan_claude_projects(&self.get_claude_projects_dir(), cancel);
 
         // OMP / pi-compatible anthropic rows, deduped across shared files.
         let mut seen_pi = HashSet::new();
@@ -479,7 +449,62 @@ impl CostScanner {
             cancel,
             &mut seen_pi,
         );
+        summary.known_zero = summary.known_zero && claude_summary_is_empty(&summary);
 
+        summary
+    }
+
+    /// Scan one Claude projects directory. A finished walk over an existing
+    /// directory that was not cancelled and read every folder and file is the
+    /// whole history of the window, so it establishes coverage (and a known
+    /// zero when it found nothing). A missing directory, a cancelled walk or
+    /// an unreadable folder/file leaves coverage unestablished.
+    fn scan_claude_projects(
+        &self,
+        projects_dir: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> CostSummary {
+        let mut summary = CostSummary::default();
+        let today = Utc::now().date_naive();
+        let start_date = today - Duration::days(self.days as i64);
+        let cutoff = Utc::now() - Duration::days(self.days as i64);
+
+        summary.period_start = Some(start_date);
+        summary.period_end = Some(today);
+
+        // Walk through projects directory, de-duplicating usage records
+        // that appear across multiple files.
+        let mut read_complete = false;
+        if projects_dir.exists() {
+            read_complete = true;
+            let mut seen = HashSet::new();
+            let mut pricing = ClaudeScanPricingResolver::default();
+            let mut handle_file = |path: &Path| {
+                let Some(counted) = for_each_claude_usage_record_with_pricing(
+                    path,
+                    &cutoff,
+                    &mut seen,
+                    cancel,
+                    &mut pricing,
+                    |record| {
+                        add_claude_record_to_summary(&mut summary, record);
+                    },
+                ) else {
+                    read_complete = false;
+                    return;
+                };
+                if counted > 0 {
+                    summary.sessions_count += 1;
+                }
+            };
+            if !self.walk_claude_files(projects_dir, &cutoff, cancel, &mut handle_file) {
+                read_complete = false;
+            }
+        }
+
+        summary.history_coverage_established = read_complete && !is_cancelled(cancel);
+        summary.known_zero =
+            summary.history_coverage_established && claude_summary_is_empty(&summary);
         summary
     }
 
@@ -526,43 +551,58 @@ impl CostScanner {
         home.join(".config").join("claude").join("projects")
     }
 
+    /// Calls `on_file` for every in-window `.jsonl` file under `dir`.
+    /// Returns false when a folder could not be listed or a file's
+    /// modification time could not be read, so the walk missed files.
     fn walk_claude_files<F>(
         &self,
         dir: &Path,
         cutoff: &DateTime<Utc>,
         cancel: Option<&AtomicBool>,
         on_file: &mut F,
-    ) where
+    ) -> bool
+    where
         F: FnMut(&Path),
     {
         if is_cancelled(cancel) {
-            return;
+            return true;
         }
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => return false,
         };
 
+        let mut complete = true;
         for entry in entries.flatten() {
             if is_cancelled(cancel) {
                 break;
             }
             let path = entry.path();
             if path.is_dir() {
-                self.walk_claude_files(&path, cutoff, cancel, on_file);
+                complete &= self.walk_claude_files(&path, cutoff, cancel, on_file);
             } else if path.extension().is_some_and(|e| e == "jsonl") {
                 // Check file modification time
-                if let Ok(metadata) = fs::metadata(&path)
-                    && let Ok(modified) = metadata.modified()
-                {
-                    let modified_dt: DateTime<Utc> = modified.into();
-                    if modified_dt >= *cutoff {
-                        on_file(&path);
-                    }
+                let Ok(modified) = fs::metadata(&path).and_then(|metadata| metadata.modified())
+                else {
+                    complete = false;
+                    continue;
+                };
+                let modified_dt: DateTime<Utc> = modified.into();
+                if modified_dt >= *cutoff {
+                    on_file(&path);
                 }
             }
         }
+        complete
     }
+}
+
+fn claude_summary_is_empty(summary: &CostSummary) -> bool {
+    summary.sessions_count == 0
+        && summary.input_tokens == 0
+        && summary.output_tokens == 0
+        && summary.cached_tokens == 0
+        && summary.total_cost_usd == 0.0
 }
 
 /// Stream the de-duplicated, in-window usage records from one transcript
@@ -583,8 +623,11 @@ where
 {
     let mut pricing = ClaudeScanPricingResolver::default();
     for_each_claude_usage_record_with_pricing(path, cutoff, seen, cancel, &mut pricing, on_record)
+        .unwrap_or(0)
 }
 
+/// Returns the number of records consumed, or None when the file could not
+/// be opened or read to its end.
 fn for_each_claude_usage_record_with_pricing<F>(
     path: &Path,
     cutoff: &DateTime<Utc>,
@@ -592,19 +635,17 @@ fn for_each_claude_usage_record_with_pricing<F>(
     cancel: Option<&AtomicBool>,
     pricing: &mut ClaudeScanPricingResolver,
     mut on_record: F,
-) -> usize
+) -> Option<usize>
 where
     F: FnMut(&ClaudeUsageRecord),
 {
-    let Ok(file) = File::open(path) else {
-        return 0;
-    };
+    let file = File::open(path).ok()?;
 
     let mut counted = 0;
     // Use read_until so a final incomplete line (no trailing newline) is still
     // processed when it is valid UTF-8 JSON, and so a single bad line does not
     // stop the walk the way `lines().map_while(Result::ok)` would.
-    for_each_jsonl_text_line(BufReader::new(file), |line| {
+    let read_ok = for_each_jsonl_text_line(BufReader::new(file), |line| {
         if is_cancelled(cancel) {
             return false;
         }
@@ -618,12 +659,13 @@ where
         }
         true
     });
-    counted
+    read_ok.then_some(counted)
 }
 
 /// Walk JSONL text lines from `reader`, including a final incomplete line at EOF.
 /// Continues past invalid UTF-8 segments. `on_line` returns `false` to stop early.
-fn for_each_jsonl_text_line<R, F>(mut reader: R, mut on_line: F)
+/// Returns false when reading failed before the end of the input.
+fn for_each_jsonl_text_line<R, F>(mut reader: R, mut on_line: F) -> bool
 where
     R: BufRead,
     F: FnMut(&str) -> bool,
@@ -634,7 +676,7 @@ where
         match reader.read_until(b'\n', &mut buf) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(_) => break,
+            Err(_) => return false,
         }
         while matches!(buf.last(), Some(b'\n' | b'\r')) {
             buf.pop();
@@ -646,6 +688,7 @@ where
             break;
         }
     }
+    true
 }
 
 #[cfg(test)]
