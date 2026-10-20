@@ -41,6 +41,12 @@ pub enum ConfigCommand {
         #[arg(long)]
         pretty: bool,
     },
+    /// Allow or stop reading Claude Code's own credentials for Claude usage
+    ClaudeConsent {
+        /// on or off
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     /// Enable a provider
     Enable {
         /// Provider CLI name or alias
@@ -82,6 +88,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             json,
             pretty,
         } => list_providers(json || format == "json", pretty).await,
+        ConfigCommand::ClaudeConsent { state } => set_claude_consent(state == "on").await,
         ConfigCommand::Enable { provider } => set_provider_enabled(&provider, true).await,
         ConfigCommand::Disable { provider } => set_provider_enabled(&provider, false).await,
         ConfigCommand::SetApiKey {
@@ -392,6 +399,14 @@ fn provider_statuses_json(statuses: &[ProviderStatus], pretty: bool) -> anyhow::
     } else {
         serde_json::to_string(statuses)?
     })
+}
+
+async fn set_claude_consent(allowed: bool) -> anyhow::Result<()> {
+    let mut settings = Settings::load();
+    settings.claude_allow_reading_claude_code_credentials = allowed;
+    settings.save()?;
+    println!("claude_allow_reading_claude_code_credentials: {allowed}");
+    Ok(())
 }
 
 /// Enable or disable a provider by CLI name.
