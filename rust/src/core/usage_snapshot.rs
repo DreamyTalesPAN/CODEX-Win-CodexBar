@@ -519,6 +519,30 @@ impl CostSnapshot {
         self.balance
             .map(|b| format_currency(b, &self.currency_code))
     }
+
+    /// The spending cap in the shape the Mac CodexBar puts at
+    /// `usage.providerCost`: `{ limit, used, currencyCode, period }`.
+    ///
+    /// Only a known, finite limit and a currency make it a cap; otherwise
+    /// `None` and the key stays out. An empty period is left out as well.
+    pub fn provider_cost_json(&self) -> Option<serde_json::Value> {
+        let limit = self.limit.filter(|limit| limit.is_finite())?;
+        let used = finite_amount(self.used)?;
+        let currency = self.currency_code.trim();
+        if currency.is_empty() {
+            return None;
+        }
+        let mut cost = serde_json::json!({
+            "limit": limit,
+            "used": used,
+            "currencyCode": currency,
+        });
+        let period = self.period.trim();
+        if !period.is_empty() {
+            cost["period"] = serde_json::Value::from(period);
+        }
+        Some(cost)
+    }
 }
 
 /// Format a value as currency
@@ -595,6 +619,22 @@ impl ProviderFetchResult {
         self
     }
 
+    /// The `usage` object as sent by `usage --json` and serve `/usage`: the
+    /// serialized snapshot plus `providerCost` (Mac CodexBar shape) when the
+    /// provider reports a spending limit. `cost` stays untouched next to it.
+    pub fn usage_json(&self) -> serde_json::Value {
+        let mut usage = serde_json::to_value(&self.usage).unwrap_or(serde_json::Value::Null);
+        if let (Some(object), Some(cost)) = (
+            usage.as_object_mut(),
+            self.cost
+                .as_ref()
+                .and_then(CostSnapshot::provider_cost_json),
+        ) {
+            object.insert("providerCost".to_string(), cost);
+        }
+        usage
+    }
+
     /// Return the stable account identity for internal correlation checks.
     pub fn account_identity(&self) -> Option<&str> {
         self.account_identity.as_deref()
@@ -632,6 +672,46 @@ mod tests {
                 .with_non_authoritative_pace()
                 .pace_authoritative
         );
+    }
+
+    #[test]
+    fn usage_json_carries_provider_cost_in_mac_shape_next_to_cost() {
+        let mut result = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(25.0)), "api");
+        result.cost = Some(CostSnapshot::new(12.5, "EUR", "Monthly cap").with_limit(100.0));
+
+        let usage = result.usage_json();
+        let cost = &usage["providerCost"];
+        assert_eq!(cost["limit"], 100.0);
+        assert_eq!(cost["used"], 12.5);
+        assert_eq!(cost["currencyCode"], "EUR");
+        assert_eq!(cost["period"], "Monthly cap");
+        assert_eq!(cost.as_object().unwrap().len(), 4);
+        // The rest of `usage` is the plain serialized snapshot.
+        assert_eq!(
+            usage["primary"],
+            serde_json::to_value(&result.usage).unwrap()["primary"]
+        );
+        // `cost` itself is not touched.
+        let wire = serde_json::to_value(&result).unwrap();
+        assert!(wire["cost"].get("currency_code").is_some());
+        assert!(wire["cost"].get("providerCost").is_none());
+    }
+
+    #[test]
+    fn usage_json_leaves_provider_cost_out_when_no_limit_is_known() {
+        let mut result = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(25.0)), "api");
+        assert!(result.usage_json().get("providerCost").is_none());
+
+        result.cost = Some(CostSnapshot::new(3.0, "USD", "Monthly"));
+        assert!(result.usage_json().get("providerCost").is_none());
+
+        result.cost = Some(CostSnapshot::new(3.0, "", "Monthly").with_limit(10.0));
+        assert!(result.usage_json().get("providerCost").is_none());
+
+        result.cost = Some(CostSnapshot::new(3.0, "USD", "").with_limit(10.0));
+        let usage = result.usage_json();
+        assert_eq!(usage["providerCost"]["limit"], 10.0);
+        assert!(usage["providerCost"].get("period").is_none());
     }
 
     #[test]

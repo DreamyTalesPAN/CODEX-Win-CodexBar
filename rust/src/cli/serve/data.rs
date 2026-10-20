@@ -54,7 +54,7 @@ pub async fn usage_response(provider: Option<&str>, source: Option<&str>) -> Str
             Ok(result) => results.push(json!({
                 "provider": provider_id.cli_name(),
                 "source": result.source_label,
-                "usage": result.usage,
+                "usage": result.usage_json(),
                 "cost": result.cost,
             })),
             Err(error) => results.push(json!({

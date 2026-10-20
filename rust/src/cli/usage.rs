@@ -397,7 +397,7 @@ fn render_json_result(
     let mut json_result = serde_json::json!({
         "provider": provider_id.cli_name(),
         "source": result.source_label,
-        "usage": result.usage,
+        "usage": result.usage_json(),
         "cost": result.cost,
     });
     if primary_pace.is_some() || secondary_pace.is_some() {
