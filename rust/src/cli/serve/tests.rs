@@ -63,6 +63,7 @@ fn validate_serve_args_accepts_loopback_without_token() {
         dashboard_token: None,
         allow_plain_http: false,
         identity: Some("redacted".into()),
+        request_timeout: 0.0,
     })
     .unwrap();
     assert_eq!(config.host, "127.0.0.1");
@@ -78,6 +79,7 @@ fn validate_serve_args_rejects_lan_without_token() {
         dashboard_token: None,
         allow_plain_http: true,
         identity: Some("redacted".into()),
+        request_timeout: 0.0,
     })
     .unwrap_err()
     .to_string();
@@ -93,6 +95,7 @@ fn validate_serve_args_rejects_lan_without_allow_plain_http() {
         dashboard_token: Some("tok".into()),
         allow_plain_http: false,
         identity: Some("redacted".into()),
+        request_timeout: 0.0,
     })
     .unwrap_err()
     .to_string();
@@ -155,6 +158,7 @@ fn head_test_config(budget: Duration, token: Option<&str>) -> ServeConfig {
         token_digest: token.map(|t| sha256_digest(t.as_bytes())),
         head_read_budget: budget,
         identity: Some(DashboardIdentity::Redacted),
+        request_timeout: None,
         dashboard: None,
     }
 }
@@ -868,4 +872,110 @@ async fn request_roundtrip_dashboard(request: &[u8], config: ServeConfig) -> Str
     drop(client);
     server_task.await.unwrap().unwrap();
     String::from_utf8_lossy(&response).into_owned()
+}
+
+#[derive(clap::Parser)]
+struct ServeCli {
+    #[command(flatten)]
+    args: ServeArgs,
+}
+
+fn parse_serve(args: &[&str]) -> Result<ServeArgs, clap::Error> {
+    use clap::Parser;
+    let mut argv = vec!["serve"];
+    argv.extend_from_slice(args);
+    ServeCli::try_parse_from(argv).map(|cli| cli.args)
+}
+
+#[test]
+fn request_timeout_option_is_accepted_as_the_mac_cli_writes_it() {
+    // What VibeTV passes on the Mac: no deadline.
+    let args = parse_serve(&["--request-timeout", "0"]).unwrap();
+    assert!(
+        validate_serve_args(&args)
+            .unwrap()
+            .request_timeout
+            .is_none()
+    );
+
+    let args = parse_serve(&["--request-timeout", "2.5"]).unwrap();
+    assert_eq!(
+        validate_serve_args(&args).unwrap().request_timeout,
+        Some(Duration::from_millis(2_500))
+    );
+
+    // Without the option the server waits as it always did.
+    let args = parse_serve(&[]).unwrap();
+    assert!(
+        validate_serve_args(&args)
+            .unwrap()
+            .request_timeout
+            .is_none()
+    );
+}
+
+#[test]
+fn request_timeout_is_capped_at_a_day_and_rejects_nonsense() {
+    assert_eq!(
+        request_timeout(1e9).unwrap(),
+        Some(Duration::from_secs(86_400))
+    );
+    for bad in [-1.0, f64::NAN, f64::INFINITY] {
+        let err = request_timeout(bad).unwrap_err().to_string();
+        assert!(err.contains("--request-timeout"), "{bad}: {err}");
+    }
+    assert!(parse_serve(&["--request-timeout", "soon"]).is_err());
+}
+
+#[tokio::test]
+async fn request_past_its_deadline_gets_504_and_its_work_still_finishes() {
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let response = answer_within(Duration::from_millis(20), async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The receiver may be gone in other tests; here it is awaited below.
+        let _sent = finished_tx.send(());
+        json_response(200, serde_json::json!({ "status": "ok" }))
+    })
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"),
+        "{response}"
+    );
+    assert!(response.ends_with(r#"{"error":"request timed out"}"#));
+    // The slow work was not cancelled by the deadline.
+    tokio::time::timeout(Duration::from_secs(2), finished_rx)
+        .await
+        .expect("work must run on past the deadline")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn request_inside_its_deadline_is_answered_unchanged() {
+    let response = answer_within(Duration::from_secs(5), async {
+        json_response(200, serde_json::json!({ "status": "ok" }))
+    })
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+}
+
+#[tokio::test]
+async fn snapshot_slower_than_the_deadline_answers_504_then_serves_the_finished_build() {
+    let state = dashboard::DashboardState::stub(
+        stub_build(DashboardIdMode::Redacted, false, Duration::from_millis(300)),
+        3600,
+        Some(DashboardIdMode::Redacted),
+    );
+    let mut config = dashboard_test_config(None, Some(state));
+    config.request_timeout = Some(Duration::from_millis(40));
+    let request: &[u8] = b"GET /dashboard/v1/snapshot HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+
+    let late = request_roundtrip_dashboard(request, config.clone()).await;
+    assert!(late.starts_with("HTTP/1.1 504 Gateway Timeout"), "{late}");
+
+    // The build ran on past the deadline and was kept: the next request is
+    // answered from it at once, inside the same short deadline.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let healed = request_roundtrip_dashboard(request, config).await;
+    assert!(healed.starts_with("HTTP/1.1 200"), "{healed}");
+    assert!(healed.contains("\"schemaVersion\": 1"));
 }
