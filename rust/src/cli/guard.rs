@@ -200,7 +200,7 @@ pub fn parse_timeout_secs(value: f64) -> Result<f64, &'static str> {
 pub fn resolve_guard_provider(raw: &str) -> Result<ProviderId, String> {
     match ProviderSelection::from_arg(Some(raw)) {
         Ok(ProviderSelection::Single(id)) => Ok(id),
-        Ok(ProviderSelection::Both | ProviderSelection::All) => {
+        Ok(ProviderSelection::Both | ProviderSelection::All | ProviderSelection::Enabled) => {
             Err("guard requires exactly one --provider.".to_string())
         }
         Err(e) => Err(e.to_string()),

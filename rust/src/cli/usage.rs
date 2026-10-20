@@ -113,6 +113,8 @@ pub enum ProviderSelection {
     Single(ProviderId),
     Both,
     All,
+    /// Every provider switched on in settings.json, in one run.
+    Enabled,
 }
 
 impl ProviderSelection {
@@ -120,6 +122,7 @@ impl ProviderSelection {
         match arg.map(|s| s.to_lowercase()).as_deref() {
             Some("all") => Ok(ProviderSelection::All),
             Some("both") => Ok(ProviderSelection::Both),
+            Some("enabled") => Ok(ProviderSelection::Enabled),
             Some(name) => {
                 if let Some(id) = ProviderId::from_cli_name(name) {
                     Ok(ProviderSelection::Single(id))
@@ -139,6 +142,14 @@ impl ProviderSelection {
             ProviderSelection::Single(id) => vec![*id],
             ProviderSelection::Both => vec![ProviderId::Codex, ProviderId::Claude],
             ProviderSelection::All => ProviderId::all().to_vec(),
+            ProviderSelection::Enabled => {
+                let settings = crate::settings::Settings::load();
+                ProviderId::all()
+                    .iter()
+                    .copied()
+                    .filter(|id| settings.is_provider_enabled(*id))
+                    .collect()
+            }
         }
     }
 }

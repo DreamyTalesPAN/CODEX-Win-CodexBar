@@ -48,6 +48,11 @@ pub struct CostArgs {
     #[arg(long = "provider-native-only")]
     pub provider_native_only: bool,
 
+    /// Rescan local logs now. Cost always rescans, so this flag only exists
+    /// so callers can pass it on every build.
+    #[arg(long)]
+    pub refresh: bool,
+
     /// Group text output by Codex local conversation/session.
     #[arg(long = "group-by", value_parser = ["session"])]
     pub group_by: Option<String>,
