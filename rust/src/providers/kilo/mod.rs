@@ -111,6 +111,10 @@ impl KiloProvider {
                         ))
                     })
             });
+        let balance = credit_blocks_data
+            .and_then(|payload| payload.get("totalBalance_mUsd"))
+            .and_then(Value::as_f64)
+            .filter(|balance| balance.is_finite());
         let primary = if let Some((total, remaining)) = totals.filter(|(total, _)| *total > 0.0) {
             let used = (total - remaining).max(0.0);
             RateWindow::with_details(
@@ -123,6 +127,8 @@ impl KiloProvider {
                     total / 1_000_000.0
                 )),
             )
+        } else if let Some(balance) = balance {
+            RateWindow::informational(format!("${:.2} balance", balance / 1_000_000.0))
         } else {
             RateWindow::informational("Credit usage unavailable")
         };
@@ -159,7 +165,7 @@ impl KiloProvider {
             }
         }
 
-        if snap.primary.is_informational && snap.secondary.is_none() {
+        if snap.primary.is_informational && snap.secondary.is_none() && balance.is_none() {
             return Err(ProviderError::Parse(
                 "Kilo response contains no usable credit quota".into(),
             ));
@@ -344,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn balance_without_allowance_is_not_a_quota() {
+    fn review16_payg_balance_without_allowance_is_information() {
         // Pay-as-you-go account: empty creditBlocks, no Kilo Pass subscription.
         // Backs the "Remaining Credits" field on app.kilo.ai/profile (#355).
         let credit_blocks = serde_json::json!({
@@ -353,7 +359,15 @@ mod tests {
             "autoTopUpEnabled": false
         });
         let kilo_pass = serde_json::json!({ "subscription": null });
-        assert!(KiloProvider::build_snapshot(Some(&credit_blocks), Some(&kilo_pass)).is_err());
+        let snapshot =
+            KiloProvider::build_snapshot(Some(&credit_blocks), Some(&kilo_pass)).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("$1.06 balance")
+        );
+        assert_eq!(snapshot.primary.resets_at, None);
+        assert!(snapshot.secondary.is_none());
     }
 }
 
@@ -365,7 +379,6 @@ mod cx289a_tests {
     fn cx289a_missing_quota_is_error() {
         assert!(KiloProvider::build_snapshot(None, None).is_err());
         for value in [
-            json!({"totalBalance_mUsd":100}),
             json!({"creditBlocks":[{"amount_mUsd":100}]}),
             json!({"creditBlocks":[{"balance_mUsd":100}]}),
         ] {
