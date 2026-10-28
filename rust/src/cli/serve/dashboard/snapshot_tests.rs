@@ -318,6 +318,49 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_dashboard_marks_unknown_lane_unavailable() {
+        let windows = vec![
+            NamedRateWindow::new("model-gemini", "Gemini Pro", RateWindow::new(20.0)),
+            NamedRateWindow::new("model-claude", "Claude Sonnet", RateWindow::new(0.0))
+                .with_usage_known(false),
+            NamedRateWindow::new("model-gpt", "GPT", RateWindow::new(0.0)),
+        ];
+        let json = serde_json::to_value(build_snapshot(&input(
+            vec![antigravity_envelope(windows)],
+            DashboardIdentity::Redacted,
+        )))
+        .unwrap();
+        let windows = json["providers"][0]["windows"].as_array().unwrap();
+        let unavailable: Vec<&str> = windows
+            .iter()
+            .filter(|window| window["unavailable"] == true)
+            .map(|window| window["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(unavailable, vec!["Claude Sonnet"]);
+    }
+
+    #[test]
+    fn informational_window_is_unavailable_and_a_real_zero_is_not() {
+        let usage = UsageSnapshot::new(RateWindow::informational("No primary quota"))
+            .with_secondary(RateWindow::new(0.0));
+        let json = serde_json::to_value(build_snapshot(&input(
+            vec![ProviderFetchEnvelope {
+                id: "windsurf".to_string(),
+                display_name: "Windsurf".to_string(),
+                session_label: "Daily".to_string(),
+                weekly_label: "Weekly".to_string(),
+                fetch: Ok(ProviderFetchResult::new(usage, "local")),
+            }],
+            DashboardIdentity::Redacted,
+        )))
+        .unwrap();
+        let windows = json["providers"][0]["windows"].as_array().unwrap();
+        assert_eq!(windows[0]["unavailable"], true);
+        assert!(windows[1].get("unavailable").is_none());
+        assert_eq!(windows[1]["usedPercent"], 0.0);
+    }
+
+    #[test]
     fn antigravity_dashboard_keeps_all_families_after_global_reset() {
         let windows = vec![
             NamedRateWindow::new("model-gemini", "Gemini Pro", RateWindow::new(0.0)),

@@ -129,7 +129,7 @@ function pctClass(used) {
   return "bar";
 }
 function visibleWindows(windows) {
-  return (windows || []).filter(w => w.idle !== true);
+  return (windows || []).filter(w => w.idle !== true && w.unavailable !== true);
 }
 function windowRow(w) {
   const used = Number.isFinite(w.usedPercent) ? Math.max(0, Math.min(100, w.usedPercent)) : 0;
