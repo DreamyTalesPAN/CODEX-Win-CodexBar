@@ -230,14 +230,16 @@ fn snapshot_from_parts(
         .and_then(|data| data.current_period_end.as_deref())
         .and_then(parse_mimo_date);
 
-    let item = usage_item
-        .ok_or_else(|| ProviderError::Parse("MiMo response contains no plan usage".into()))?;
-    let primary = RateWindow::with_details(
-        item.percent,
-        RateWindow::monthly_window_minutes(period_end),
-        period_end,
-        Some(format!("{}/{} tokens", item.used, item.limit)),
-    );
+    let primary = if let Some(item) = usage_item {
+        RateWindow::with_details(
+            item.percent,
+            RateWindow::monthly_window_minutes(period_end),
+            period_end,
+            Some(format!("{}/{} tokens", item.used, item.limit)),
+        )
+    } else {
+        RateWindow::informational("MiMo plan usage unavailable")
+    };
     let secondary = RateWindow::informational(balance_description(
         balance,
         &currency,
@@ -370,8 +372,26 @@ mod cx289a_parent_tests {
         snapshot_from_parts(5.0, "CNY".into(), None, None, None, usage)
     }
     #[test]
-    fn missing_usage_is_an_error() {
-        assert!(parse(None).is_err());
+    fn review16_missing_optional_plan_preserves_balance() {
+        for usage in [
+            None,
+            Some(json!({"code":0,"data":{"monthUsage":{"items":[]}}})),
+            Some(json!({"code":503})),
+        ] {
+            let snapshot =
+                parse(usage.map(|value| serde_json::from_value(value).unwrap())).unwrap();
+            assert!(snapshot.primary.is_informational);
+            assert_eq!(
+                snapshot.primary.reset_description.as_deref(),
+                Some("MiMo plan usage unavailable")
+            );
+            let balance = snapshot.secondary.unwrap();
+            assert!(balance.is_informational);
+            assert_eq!(
+                balance.reset_description.as_deref(),
+                Some("5.00 CNY balance")
+            );
+        }
     }
     #[test]
     fn real_zero_usage_stays_a_quota() {
