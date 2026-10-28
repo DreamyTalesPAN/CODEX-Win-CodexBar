@@ -819,24 +819,14 @@ fn result_from_billing_summary(
     summary: MiniMaxBillingSummary,
     source_label: &str,
 ) -> ProviderFetchResult {
-    let usage = UsageSnapshot::new(RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!(
-            "{} tokens today",
-            format_count(summary.today_tokens)
-        )),
-    ))
-    .with_secondary(RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!(
-            "{} tokens over last 30 days",
-            format_count(summary.last_30_days_tokens)
-        )),
-    ))
+    let usage = UsageSnapshot::new(RateWindow::informational(format!(
+        "{} tokens today",
+        format_count(summary.today_tokens)
+    )))
+    .with_secondary(RateWindow::informational(format!(
+        "{} tokens over last 30 days",
+        format_count(summary.last_30_days_tokens)
+    )))
     .with_login_method("MiniMax billing");
     attach_billing_summary(ProviderFetchResult::new(usage, source_label), summary)
 }
@@ -848,30 +838,25 @@ fn attach_billing_summary(
     result.usage = result.usage.with_extra_rate_window(
         "billing-tokens-today",
         "Tokens today",
-        RateWindow::with_details(0.0, None, None, Some(format_count(summary.today_tokens))),
+        RateWindow::informational(format_count(summary.today_tokens)),
     );
     result.usage = result.usage.with_extra_rate_window(
         "billing-tokens-30d",
         "Tokens (30 days)",
-        RateWindow::with_details(
-            0.0,
-            None,
-            None,
-            Some(format_count(summary.last_30_days_tokens)),
-        ),
+        RateWindow::informational(format_count(summary.last_30_days_tokens)),
     );
     if let Some(cash) = summary.today_cash {
         result.usage = result.usage.with_extra_rate_window(
             "billing-cash-today",
             "Spend today",
-            RateWindow::with_details(0.0, None, None, Some(format!("${cash:.2}"))),
+            RateWindow::informational(format!("${cash:.2}")),
         );
     }
     if let Some(cash) = summary.last_30_days_cash {
         result.usage = result.usage.with_extra_rate_window(
             "billing-cash-30d",
             "Spend (30 days)",
-            RateWindow::with_details(0.0, None, None, Some(format!("${cash:.2}"))),
+            RateWindow::informational(format!("${cash:.2}")),
         );
         result.cost = Some(CostSnapshot::new(cash, "USD", "Last 30 days"));
     }
@@ -879,14 +864,14 @@ fn attach_billing_summary(
         result.usage = result.usage.with_extra_rate_window(
             format!("billing-method-{idx}"),
             format!("Method: {}", item.name),
-            RateWindow::with_details(0.0, None, None, Some(breakdown_description(item))),
+            RateWindow::informational(breakdown_description(item)),
         );
     }
     for (idx, item) in summary.top_models.iter().enumerate() {
         result.usage = result.usage.with_extra_rate_window(
             format!("billing-model-{idx}"),
             format!("Model: {}", item.name),
-            RateWindow::with_details(0.0, None, None, Some(breakdown_description(item))),
+            RateWindow::informational(breakdown_description(item)),
         );
     }
     result
@@ -1204,6 +1189,28 @@ mod tests {
                 .iter()
                 .any(|window| window.id == "billing-tokens-30d")
         );
+    }
+
+    #[test]
+    fn billing_counters_without_a_denominator_are_informational() {
+        let json = serde_json::json!({
+            "base_resp": { "status_code": 0 },
+            "charge_records": [{
+                "consume_token": "2500",
+                "consume_cash_after_voucher": "1.25",
+                "ymd": Utc::now().format("%Y-%m-%d").to_string(),
+                "method": "chat",
+                "model": "abab6.5"
+            }]
+        });
+        let result =
+            result_from_billing_summary(parse_billing_summary(&json).unwrap(), "web-billing");
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.secondary.as_ref().unwrap().is_informational);
+        assert!(!result.usage.extra_rate_windows.is_empty());
+        for extra in &result.usage.extra_rate_windows {
+            assert!(extra.window.is_informational, "{}", extra.id);
+        }
     }
 
     #[test]
