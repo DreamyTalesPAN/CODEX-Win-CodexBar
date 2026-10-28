@@ -306,42 +306,50 @@ impl KimiK2Provider {
         let available_balance = data
             .get("available_balance")
             .or_else(|| data.get("balance"))
-            .and_then(finite_json_f64)
-            .unwrap_or(0.0);
+            .and_then(finite_json_f64);
 
         // Total credits (used + available)
         let total_credits = data
             .get("total_balance")
             .or_else(|| data.get("total"))
             .and_then(finite_json_f64)
-            .unwrap_or(available_balance.max(0.0));
+            .filter(|total| *total > 0.0);
 
         // Used credits
         let used_credits = data
             .get("used_balance")
             .or_else(|| data.get("used"))
             .and_then(finite_json_f64)
-            .unwrap_or(total_credits - available_balance);
-
-        // Calculate percentage used
-        let used_percent = if total_credits > 0.0 {
-            (used_credits / total_credits) * 100.0
-        } else {
-            0.0
-        };
+            .or_else(|| {
+                total_credits
+                    .zip(available_balance)
+                    .map(|(total, available)| total - available)
+            });
 
         // Cash balance (if any)
         let voucher_balance = data.get("voucher_balance").and_then(finite_json_f64);
         let cash_balance = data.get("cash_balance").and_then(finite_json_f64);
 
         // Create primary rate window (credits used)
-        let mut primary = RateWindow::new(used_percent);
-        primary.reset_description = Some(format!(
-            "Balance {}",
-            region.format_balance(available_balance)
-        ));
+        let quota = used_credits.zip(total_credits);
+        if available_balance.is_none() && quota.is_none() {
+            return Err(ProviderError::Parse(
+                "Moonshot response contains no balance or usable quota".to_string(),
+            ));
+        }
+        let detail = available_balance
+            .map(|balance| format!("Balance {}", region.format_balance(balance)))
+            .unwrap_or_else(|| "Balance unavailable".to_string());
+        let primary = match quota {
+            Some((used, total)) => {
+                RateWindow::with_details(used / total * 100.0, None, None, Some(detail))
+            }
+            None => RateWindow::informational(detail),
+        };
 
-        let mut login_method = format!("Balance: {}", region.format_balance(available_balance));
+        let mut login_method = available_balance
+            .map(|balance| format!("Balance: {}", region.format_balance(balance)))
+            .unwrap_or_else(|| "Balance unavailable".to_string());
         if let Some(cash) = cash_balance
             && cash < 0.0
         {
@@ -364,15 +372,14 @@ impl KimiK2Provider {
 
         // Add secondary window for cash balance if available
         if let Some(voucher) = voucher_balance {
-            let mut voucher_window = RateWindow::new(0.0);
-            voucher_window.reset_description =
-                Some(format!("Voucher {}", region.format_balance(voucher)));
+            let voucher_window =
+                RateWindow::informational(format!("Voucher {}", region.format_balance(voucher)));
             usage = usage.with_extra_rate_window("voucher", "Voucher balance", voucher_window);
         }
 
         if let Some(cash) = cash_balance {
-            let mut cash_window = RateWindow::new(if cash < 0.0 { 100.0 } else { 0.0 });
-            cash_window.reset_description = Some(format!("Cash {}", region.format_balance(cash)));
+            let cash_window =
+                RateWindow::informational(format!("Cash {}", region.format_balance(cash)));
             usage = usage.with_extra_rate_window("cash", "Cash balance", cash_window);
         }
 
@@ -662,5 +669,76 @@ mod tests {
                 .as_deref(),
             Some("Cash -5.00 CNY")
         );
+    }
+}
+
+#[cfg(test)]
+mod section_b_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn balances_without_total_are_informational() {
+        let snapshot = KimiK2Provider::new()
+            .parse_usage_response(
+                &json!({"data":{"available_balance":12,"voucher_balance":2,"cash_balance":-3}}),
+                MoonshotRegion::International,
+            )
+            .unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(snapshot.extra_rate_windows.len(), 2);
+        assert!(
+            snapshot
+                .extra_rate_windows
+                .iter()
+                .all(|row| row.window.is_informational)
+        );
+    }
+
+    #[test]
+    fn missing_balance_is_an_error_not_zero() {
+        for body in [
+            json!({}),
+            json!({"data":{"total_balance":10}}),
+            json!({"data":{"available_balance":"NaN"}}),
+        ] {
+            assert!(
+                KimiK2Provider::new()
+                    .parse_usage_response(&body, MoonshotRegion::International)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_used_and_total_without_balance_remain_quota() {
+        for used in [0.0, 2.5] {
+            let snapshot = KimiK2Provider::new()
+                .parse_usage_response(
+                    &json!({"data":{"used_balance":used,"total_balance":10}}),
+                    MoonshotRegion::International,
+                )
+                .unwrap();
+            assert!(!snapshot.primary.is_informational);
+            assert_eq!(snapshot.primary.used_percent, used * 10.0);
+            assert_eq!(
+                snapshot.primary.reset_description.as_deref(),
+                Some("Balance unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn actual_zero_over_total_remains_quota() {
+        for body in [
+            json!({"data":{"available_balance":10,"total_balance":10}}),
+            json!({"data":{"available_balance":10,"total_balance":10,"used_balance":0}}),
+        ] {
+            let snapshot = KimiK2Provider::new()
+                .parse_usage_response(&body, MoonshotRegion::International)
+                .unwrap();
+            assert!(!snapshot.primary.is_informational);
+            assert_eq!(snapshot.primary.used_percent, 0.0);
+        }
     }
 }
