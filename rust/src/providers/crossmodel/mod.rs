@@ -158,21 +158,12 @@ fn snapshot_from_parts(
     let currency = normalize_currency(&credits.currency);
     let balance = major_units(credits.balance_micro);
     let uncollected = major_units(credits.uncollected_micro);
-    let mut primary = usage
+    let primary = usage
         .as_ref()
         .and_then(|u| usage_window_rate(u.daily.as_ref(), "Daily"))
         .unwrap_or_else(|| {
-            RateWindow::with_details(
-                0.0,
-                Some(24 * 60),
-                None,
-                Some(format!("{} balance", format_amount(balance, &currency))),
-            )
+            RateWindow::informational(format!("{} balance", format_amount(balance, &currency)))
         });
-
-    if primary.reset_description.is_none() {
-        primary.reset_description = Some("Daily usage".to_string());
-    }
 
     let mut snapshot = UsageSnapshot::new(primary).with_login_method("API key");
     if let Some(usage) = usage
@@ -190,7 +181,7 @@ fn snapshot_from_parts(
         snapshot = snapshot.with_extra_rate_window(
             "uncollected",
             "Uncollected",
-            RateWindow::with_details(0.0, None, None, Some(format_amount(uncollected, &currency))),
+            RateWindow::informational(format_amount(uncollected, &currency)),
         );
     }
 
@@ -217,12 +208,7 @@ fn usage_window_rate(window: Option<&UsageWindow>, label: &str) -> Option<RateWi
     if let Some(completion_tokens) = window.completion_tokens {
         details.push(format!("{completion_tokens} completion"));
     }
-    Some(RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(details.join(", ")),
-    ))
+    Some(RateWindow::informational(details.join(", ")))
 }
 
 fn major_units(micro: i64) -> f64 {
@@ -313,5 +299,42 @@ mod tests {
                 .unwrap()
                 .contains("12467 tokens")
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289b_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn balance_without_quota_is_informational() {
+        let credits = serde_json::from_value(
+            json!({"currency":"USD", "balanceMicro":12500000, "uncollectedMicro":1000000}),
+        )
+        .unwrap();
+        let result = snapshot_from_parts(credits, None);
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.primary.window_minutes.is_none());
+        assert!(
+            result
+                .usage
+                .extra_rate_windows
+                .iter()
+                .all(|w| w.window.is_informational)
+        );
+    }
+    #[test]
+    fn costs_and_zero_counters_without_quota_are_informational() {
+        let credits = serde_json::from_value(json!({"currency":"USD", "balanceMicro":0})).unwrap();
+        let usage = serde_json::from_value(json!({"currency":"USD",
+            "daily":{"costMicro":0,"requestCount":0},
+            "weekly":{"costMicro":1000000,"totalTokens":50},
+            "monthly":{"costMicro":2000000}
+        }))
+        .unwrap();
+        let result = snapshot_from_parts(credits, Some(usage));
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.secondary.unwrap().is_informational);
+        assert!(result.usage.tertiary.unwrap().is_informational);
     }
 }
