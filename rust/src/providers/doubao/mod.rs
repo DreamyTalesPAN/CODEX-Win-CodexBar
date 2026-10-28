@@ -207,7 +207,7 @@ impl DoubaoProbeResult {
 fn probe_result_from_response(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
-    _body: &serde_json::Value,
+    body: &serde_json::Value,
 ) -> DoubaoProbeResult {
     let remaining = int_header(headers, "x-ratelimit-remaining-requests");
     let limit = int_header(headers, "x-ratelimit-limit-requests");
@@ -218,7 +218,24 @@ fn probe_result_from_response(
         limit.is_some() && remaining.is_some()
     };
 
-    let snapshot = snapshot_from_parts(remaining, limit, resets_at, request_limits_reliable);
+    let mut snapshot = snapshot_from_parts(remaining, limit, resets_at, request_limits_reliable);
+    if status.is_success()
+        && let Some(tokens) = body
+            .pointer("/usage/total_tokens")
+            .and_then(serde_json::Value::as_u64)
+    {
+        let information = RateWindow::informational(format!(
+            "{tokens} tokens observed in probe; request quota unavailable"
+        ));
+        snapshot = Ok(match snapshot {
+            Ok(snapshot) => snapshot.with_extra_rate_window(
+                "probe",
+                "Probe",
+                RateWindow::informational(format!("{tokens} tokens observed in probe")),
+            ),
+            Err(_) => UsageSnapshot::new(information),
+        });
+    }
 
     DoubaoProbeResult {
         snapshot,
@@ -1188,5 +1205,30 @@ mod cx289a_tests {
             coding(br#"{"Result":{"QuotaUsage":[{"Level":"session","Percent":0}]}}"#).unwrap();
         assert!(!snap.primary.is_informational);
         assert_eq!(snap.primary.used_percent, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod p1_03_probe_tokens_are_information_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_03_probe_tokens_are_information() {
+        let result = probe_result_from_response(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            &serde_json::json!({"usage":{"total_tokens":7}}),
+        );
+        let snapshot = result.snapshot.unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert!(
+            snapshot
+                .primary
+                .reset_description
+                .unwrap()
+                .contains("7 tokens")
+        );
+        assert!(snapshot.primary.resets_at.is_none());
+        assert!(snapshot.primary.window_minutes.is_none());
+        assert!(!result.request_limits_reliable);
     }
 }
