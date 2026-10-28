@@ -194,18 +194,18 @@ fn parse_scalar(data: &[u8]) -> Result<f64, ProviderError> {
                 .unwrap_or_else(|| "Groq metrics query failed.".to_string()),
         ));
     }
-    Ok(decoded
+    decoded
         .data
-        .map(|payload| {
-            payload
-                .result
-                .iter()
-                .filter_map(|series| series.value.as_ref())
-                .filter_map(|value| value.last())
-                .filter_map(PrometheusValue::as_f64)
-                .sum()
+        .into_iter()
+        .flat_map(|payload| payload.result)
+        .filter_map(|series| series.value)
+        .filter_map(|value| value.last().and_then(PrometheusValue::as_f64))
+        .filter(|value| value.is_finite())
+        .reduce(|total, value| total + value)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| {
+            ProviderError::Parse("Groq metrics response contains no usable scalar".to_string())
         })
-        .unwrap_or(0.0))
 }
 
 fn snapshot_from_metrics(metrics: &GroqMetrics) -> UsageSnapshot {
@@ -214,30 +214,14 @@ fn snapshot_from_metrics(metrics: &GroqMetrics) -> UsageSnapshot {
         (metrics.input_token_rate_per_second + metrics.output_token_rate_per_second) * 60.0;
     let cache_hits_per_minute = metrics.prompt_cache_hit_rate_per_second * 60.0;
 
-    let mut primary = RateWindow::with_details(
-        0.0,
-        Some(5),
-        None,
-        Some(format!("{} req/min", format_metric(requests_per_minute))),
-    );
-    primary.used_percent = 0.0;
-
-    let secondary = RateWindow::with_details(
-        0.0,
-        Some(5),
-        None,
-        Some(format!("{} tok/min", format_metric(tokens_per_minute))),
-    );
-
-    let tertiary = RateWindow::with_details(
-        0.0,
-        Some(5),
-        None,
-        Some(format!(
-            "{} cache/min",
-            format_metric(cache_hits_per_minute)
-        )),
-    );
+    let primary =
+        RateWindow::informational(format!("{} req/min", format_metric(requests_per_minute)));
+    let secondary =
+        RateWindow::informational(format!("{} tok/min", format_metric(tokens_per_minute)));
+    let tertiary = RateWindow::informational(format!(
+        "{} cache/min",
+        format_metric(cache_hits_per_minute)
+    ));
 
     UsageSnapshot::new(primary)
         .with_secondary(secondary)
@@ -325,6 +309,56 @@ mod tests {
                 .as_ref()
                 .and_then(|w| w.reset_description.as_deref()),
             Some("900 tok/min")
+        );
+    }
+}
+
+#[cfg(test)]
+mod section_b_tests {
+    use super::*;
+
+    #[test]
+    fn rates_without_limits_are_informational() {
+        for value in [0.0, 2.0] {
+            let snapshot = snapshot_from_metrics(&GroqMetrics {
+                request_rate_per_second: value,
+                input_token_rate_per_second: value,
+                output_token_rate_per_second: value,
+                prompt_cache_hit_rate_per_second: value,
+            });
+            for window in [
+                Some(snapshot.primary),
+                snapshot.secondary,
+                snapshot.tertiary,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(window.is_informational);
+                assert!(window.window_minutes.is_none());
+                assert!(window.resets_at.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_scalar_is_an_error_not_zero() {
+        for body in [
+            r#"{"status":"success"}"#,
+            r#"{"status":"success","data":{"result":[]}}"#,
+            r#"{"status":"success","data":{"result":[{"value":[123,"bad"]}]}}"#,
+            r#"{"status":"success","data":{"result":[{"value":[123,"NaN"]}]}}"#,
+        ] {
+            assert!(parse_scalar(body.as_bytes()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn actual_zero_scalar_is_preserved() {
+        assert_eq!(
+            parse_scalar(br#"{"status":"success","data":{"result":[{"value":[123,"0"]}]}}"#)
+                .unwrap(),
+            0.0
         );
     }
 }
