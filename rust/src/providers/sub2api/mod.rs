@@ -943,7 +943,7 @@ mod tests {
         }
         "#;
 
-        let result = snapshot_from_parsed(parse_usage_body(json).unwrap());
+        let result = snapshot_from_parsed(parse_usage_body(json).unwrap()).unwrap();
         let expires = result
             .usage
             .extra_rate_windows
