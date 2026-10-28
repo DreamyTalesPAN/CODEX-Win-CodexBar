@@ -2,7 +2,7 @@
 //!
 //! Mirrors upstream `OpenCodeGoLocalUsageReader`: sums `opencode-go` assistant
 //! message / step-finish costs from the local OpenCode database and maps them
-//! onto session ($12 / 5h), weekly ($30), and monthly ($60) windows.
+//! as observed local costs. Local history cannot establish server quotas.
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use rusqlite::Connection;
@@ -12,9 +12,6 @@ use crate::core::{ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot}
 
 const FIVE_HOURS_MS: i64 = 5 * 60 * 60 * 1000;
 const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-const SESSION_LIMIT_USD: f64 = 12.0;
-const WEEKLY_LIMIT_USD: f64 = 30.0;
-const MONTHLY_LIMIT_USD: f64 = 60.0;
 const PROVIDER_ID: &str = "opencode-go";
 
 const MESSAGE_USAGE_SQL: &str = r#"
@@ -80,43 +77,23 @@ pub(crate) struct UsageRow {
 
 #[derive(Debug, Clone)]
 pub struct LocalUsageSnapshot {
-    pub rolling_usage_percent: f64,
-    pub weekly_usage_percent: f64,
-    pub monthly_usage_percent: f64,
-    /// `None` when no usage falls inside the last five hours: no active session, no reset.
-    pub rolling_reset_in_sec: Option<i64>,
-    pub weekly_reset_in_sec: i64,
-    pub monthly_reset_in_sec: i64,
+    pub rolling_cost_usd: f64,
+    pub weekly_cost_usd: f64,
+    pub monthly_cost_usd: f64,
+    pub observed_cost_usd: f64,
 }
 
 impl LocalUsageSnapshot {
     pub fn to_fetch_result(&self) -> ProviderFetchResult {
-        let now = Utc::now();
-        let primary = RateWindow::with_details(
-            self.rolling_usage_percent,
-            Some(300),
-            self.rolling_reset_in_sec
-                .map(|seconds| now + Duration::seconds(seconds)),
-            None,
-        );
-        let mut snap = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
-        snap = snap.with_secondary(RateWindow::with_details(
-            self.weekly_usage_percent,
-            Some(10080),
-            Some(now + Duration::seconds(self.weekly_reset_in_sec)),
-            None,
+        let primary = RateWindow::informational(format!(
+            "Local cost: ${:.2} in last 5h, ${:.2} this week, ${:.2} in the local monthly period, ${:.2} in history; quota unavailable",
+            self.rolling_cost_usd,
+            self.weekly_cost_usd,
+            self.monthly_cost_usd,
+            self.observed_cost_usd,
         ));
-        let monthly_reset = now + Duration::seconds(self.monthly_reset_in_sec);
-        snap = snap.with_tertiary(RateWindow::with_details(
-            self.monthly_usage_percent,
-            RateWindow::monthly_window_minutes(Some(monthly_reset)).or(Some(43200)),
-            Some(monthly_reset),
-            None,
-        ));
-        // Upstream 0.51 (#2982): local SQLite quota reconstruction is useful
-        // but it is not server-confirmed authority. Keep that distinction in
-        // the data contract so CLI/React can present it without guessing.
-        ProviderFetchResult::new(snap, super::LOCAL_ESTIMATE_SOURCE_LABEL)
+        let snapshot = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
+        ProviderFetchResult::new(snapshot, super::LOCAL_ESTIMATE_SOURCE_LABEL)
             .with_non_authoritative_pace()
     }
 }
@@ -284,15 +261,10 @@ fn snapshot_from_rows(rows: &[UsageRow], now: DateTime<Utc>) -> LocalUsageSnapsh
     let mut session_cost = 0.0;
     let mut weekly_cost = 0.0;
     let mut monthly_cost = 0.0;
-    let mut oldest_session_ms: Option<i64> = None;
 
     for row in rows {
         if row.created_ms >= session_start && row.created_ms < now_ms {
             session_cost += row.cost;
-            oldest_session_ms = Some(match oldest_session_ms {
-                Some(prev) => prev.min(row.created_ms),
-                None => row.created_ms,
-            });
         }
         if row.created_ms >= week_start_ms && row.created_ms < week_end_ms {
             weekly_cost += row.cost;
@@ -302,25 +274,12 @@ fn snapshot_from_rows(rows: &[UsageRow], now: DateTime<Utc>) -> LocalUsageSnapsh
         }
     }
 
-    let rolling_reset_in_sec =
-        oldest_session_ms.map(|oldest| ((oldest + FIVE_HOURS_MS - now_ms) / 1000).max(0));
-
     LocalUsageSnapshot {
-        rolling_usage_percent: percent(session_cost, SESSION_LIMIT_USD),
-        weekly_usage_percent: percent(weekly_cost, WEEKLY_LIMIT_USD),
-        monthly_usage_percent: percent(monthly_cost, MONTHLY_LIMIT_USD),
-        rolling_reset_in_sec,
-        weekly_reset_in_sec: ((week_end_ms - now_ms) / 1000).max(0),
-        monthly_reset_in_sec: ((month_end_ms - now_ms) / 1000).max(0),
+        rolling_cost_usd: session_cost,
+        weekly_cost_usd: weekly_cost,
+        monthly_cost_usd: monthly_cost,
+        observed_cost_usd: rows.iter().map(|row| row.cost).sum(),
     }
-}
-
-fn percent(used: f64, limit: f64) -> f64 {
-    if !used.is_finite() || limit <= 0.0 {
-        return 0.0;
-    }
-    let value = (used / limit * 100.0).clamp(0.0, 100.0);
-    (value * 10.0).round() / 10.0
 }
 
 /// Bucket label for rows whose local `modelID` is missing or blank (upstream #2649).
@@ -609,55 +568,26 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn local_fetch_result_keeps_estimate_source_and_reset_windows() {
+    fn local_fetch_result_preserves_observed_costs_without_quota_windows() {
         let result = LocalUsageSnapshot {
-            rolling_usage_percent: 12.0,
-            weekly_usage_percent: 23.0,
-            monthly_usage_percent: 34.0,
-            rolling_reset_in_sec: Some(300),
-            weekly_reset_in_sec: 1_000,
-            monthly_reset_in_sec: 2_000,
+            rolling_cost_usd: 1.234,
+            weekly_cost_usd: 23.0,
+            monthly_cost_usd: 34.0,
+            observed_cost_usd: 50.0,
         }
         .to_fetch_result();
-
         assert_eq!(
             result.source_label,
             super::super::LOCAL_ESTIMATE_SOURCE_LABEL
         );
-        assert_eq!(result.usage.primary.used_percent, 12.0);
-        assert_eq!(result.usage.secondary.as_ref().unwrap().used_percent, 23.0);
-        assert_eq!(result.usage.tertiary.as_ref().unwrap().used_percent, 34.0);
-        assert!(result.usage.primary.resets_at.is_some());
-        assert!(result.usage.secondary.as_ref().unwrap().resets_at.is_some());
-        assert!(result.usage.tertiary.as_ref().unwrap().resets_at.is_some());
-    }
-
-    #[test]
-    fn local_estimate_without_active_session_has_no_session_reset() {
-        let now = Utc::now();
-        let old = now.timestamp_millis() - 90 * 24 * 60 * 60 * 1000;
-        let rows = [UsageRow {
-            created_ms: old,
-            cost: 3.0,
-            request_count: 1,
-            model: String::new(),
-        }];
-        let result = snapshot_from_rows(&rows, now).to_fetch_result();
-        assert_eq!(
-            result.source_label,
-            super::super::LOCAL_ESTIMATE_SOURCE_LABEL
-        );
-        assert_eq!(result.usage.primary.used_percent, 0.0);
-        assert_eq!(result.usage.primary.resets_at, None);
-
-        let recent = [UsageRow {
-            created_ms: now.timestamp_millis() - 60 * 60 * 1000,
-            cost: 3.0,
-            request_count: 1,
-            model: String::new(),
-        }];
-        let result = snapshot_from_rows(&recent, now).to_fetch_result();
-        assert!(result.usage.primary.resets_at.is_some());
+        assert!(result.usage.primary.is_informational);
+        let detail = result.usage.primary.reset_description.unwrap();
+        for amount in ["1.23", "23.00", "34.00", "50.00"] {
+            assert!(detail.contains(amount));
+        }
+        assert!(result.usage.primary.resets_at.is_none());
+        assert!(result.usage.secondary.is_none());
+        assert!(result.usage.tertiary.is_none());
     }
 
     fn temp_db_path(label: &str) -> PathBuf {
@@ -790,9 +720,9 @@ mod tests {
         let db = temp_db_path("sums");
         let now = Utc.with_ymd_and_hms(2026, 3, 18, 12, 0, 0).unwrap(); // Wednesday
         let now_ms = now.timestamp_millis();
-        // $6 in the rolling 5h window → 50% of $12
-        // $15 in ISO week → 50% of $30
-        // $30 in anchored month → 50% of $60
+        // $6 in the rolling 5h window
+        // $15 in ISO week
+        // $30 in anchored month
         let session_ms = now_ms - 60_000;
         let week_ms = start_of_utc_iso_week_ms(now) + 3_600_000;
         let month_anchor_ms = now_ms - 10 * 24 * 60 * 60 * 1000;
@@ -811,11 +741,11 @@ mod tests {
         let _written = std::fs::write(&auth, r#"{"opencode-go":{"key":"test-key"}}"#);
 
         let snap = fetch_from_paths(&auth, &db, now).unwrap();
-        assert!((snap.rolling_usage_percent - 50.0).abs() < 0.05, "{snap:?}");
-        // session 6 + week-only 9 = 15 → 50%
-        assert!((snap.weekly_usage_percent - 50.0).abs() < 0.05, "{snap:?}");
-        // session 6 + week 9 + month 15 = 30 → 50%
-        assert!((snap.monthly_usage_percent - 50.0).abs() < 0.05, "{snap:?}");
+        assert!((snap.rolling_cost_usd - 6.0).abs() < 0.05, "{snap:?}");
+        // session 6 + week-only 9 = 15
+        assert!((snap.weekly_cost_usd - 15.0).abs() < 0.05, "{snap:?}");
+        // session 6 + week 9 + month 15 = 30
+        assert!((snap.monthly_cost_usd - 30.0).abs() < 0.05, "{snap:?}");
 
         // Best-effort teardown; leftover temp files are harmless.
         let _removed_db = std::fs::remove_file(&db);
@@ -862,19 +792,12 @@ mod tests {
         let _written_auth = std::fs::write(&auth, r#"{"opencode-go":{"key":"k"}}"#);
         let snap = fetch_from_paths(&auth, &db, now).unwrap();
         assert!(
-            (snap.rolling_usage_percent - 25.0).abs() < 0.05,
+            (snap.rolling_cost_usd - 3.0).abs() < 0.05,
             "expected step-finish cost only, got {snap:?}"
         );
         // Best-effort teardown; leftover temp files are harmless.
         let _removed_db = std::fs::remove_file(&db);
         let _removed_auth = std::fs::remove_file(&auth);
-    }
-
-    #[test]
-    fn percent_rounds_to_one_decimal() {
-        assert!((percent(1.0, 12.0) - 8.3).abs() < 0.05);
-        assert_eq!(percent(0.0, 12.0), 0.0);
-        assert_eq!(percent(f64::NAN, 12.0), 0.0);
     }
 
     #[test]
@@ -941,7 +864,7 @@ mod tests {
         assert!(!shm.exists(), "precondition: no -shm");
 
         let snap = fetch_from_paths(&auth, &db, Utc::now()).expect("read idle WAL db");
-        assert!(snap.rolling_usage_percent > 0.0, "{snap:?}");
+        assert!(snap.rolling_cost_usd > 0.0, "{snap:?}");
 
         assert!(
             !wal.exists() && !shm.exists(),
@@ -1255,5 +1178,37 @@ mod tests {
         let b2 = daily_model_costs(&rows, now, 30);
         assert_eq!(b1, b2, "pure aggregation must be deterministic");
         assert_eq!(b1.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod p1_16_local_history_never_exports_a_quota_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_16_local_history_never_exports_a_quota() {
+        let now = Utc::now();
+        for age_days in [90, 0] {
+            let rows = [UsageRow {
+                created_ms: now.timestamp_millis() - age_days * 24 * 60 * 60 * 1000 - 60000,
+                cost: 3.0,
+                request_count: 1,
+                model: String::new(),
+            }];
+            let result = snapshot_from_rows(&rows, now).to_fetch_result();
+            let json = serde_json::to_value(&result.usage).unwrap();
+            assert_eq!(json["primary"]["is_informational"], true);
+            assert!(result.usage.primary.resets_at.is_none());
+            assert!(result.usage.primary.window_minutes.is_none());
+            assert!(result.usage.secondary.is_none());
+            assert!(result.usage.tertiary.is_none());
+            assert!(
+                result
+                    .usage
+                    .primary
+                    .reset_description
+                    .unwrap()
+                    .contains("3.00")
+            );
+        }
     }
 }
