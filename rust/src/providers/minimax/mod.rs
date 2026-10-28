@@ -377,14 +377,14 @@ impl MiniMaxProvider {
             .get("used_amount")
             .or_else(|| json.get("total_amount"))
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| ProviderError::Parse("MiniMax usage counter missing".into()))?;
+            .ok_or_else(|| ProviderError::Parse("MiniMax response contains no usage counter".into()))?;
 
         let credit_limit = json
             .get("total_quota")
             .or_else(|| json.get("quota"))
             .and_then(|v| v.as_f64())
             .filter(|limit| *limit > 0.0)
-            .ok_or_else(|| ProviderError::Parse("MiniMax quota total missing".into()))?;
+            .ok_or_else(|| ProviderError::Parse("MiniMax response contains no quota total".into()))?;
 
         let used_percent = (used_credits / credit_limit) * 100.0;
 

@@ -89,7 +89,7 @@ impl PerplexityProvider {
 
         for grant in &resp.credit_grants {
             let amount = grant.amount_cents.ok_or_else(|| {
-                ProviderError::Parse("Perplexity credit grant amount missing".into())
+                ProviderError::Parse("Perplexity response contains no credit grant amount".into())
             })?;
             match grant.grant_type.as_str() {
                 "recurring" => recurring_total += amount,
@@ -113,7 +113,7 @@ impl PerplexityProvider {
         // Waterfall attribution: usage burns recurring first, then bonus, then purchased.
         let mut remaining_usage = resp
             .total_usage_cents
-            .ok_or_else(|| ProviderError::Parse("Perplexity usage counter missing".into()))?
+            .ok_or_else(|| ProviderError::Parse("Perplexity response contains no usage counter".into()))?
             .max(0.0);
         if recurring_total <= 0.0 && bonus_total <= 0.0 && purchased_total <= 0.0 {
             return Err(ProviderError::Parse(

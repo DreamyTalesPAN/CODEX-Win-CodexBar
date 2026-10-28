@@ -501,7 +501,7 @@ fn totals_from_api_payload(value: &Value) -> Result<CreditTotals, ProviderError>
 
     for account in accounts {
         let account_total = precise_or_field(account, "CapacitySizePrecise", "CapacitySize")
-            .ok_or_else(|| ProviderError::Parse("CodeBuddy package total missing".into()))?;
+            .ok_or_else(|| ProviderError::Parse("CodeBuddy response contains no package total".into()))?;
         let totals = CreditTotals::normalized(
             account_total,
             precise_or_field(account, "CapacityUsedPrecise", "CapacityUsed"),
@@ -529,7 +529,7 @@ impl CreditTotals {
     ) -> Result<CreditTotals, ProviderError> {
         let used = used
             .or_else(|| remaining.map(|remaining| total - remaining))
-            .ok_or_else(|| ProviderError::Parse("CodeBuddy usage counter missing".into()))?;
+            .ok_or_else(|| ProviderError::Parse("CodeBuddy response contains no usage counter".into()))?;
         let remaining = remaining.unwrap_or(total - used);
         if !(total.is_finite() && total > 0.0 && used.is_finite() && remaining.is_finite()) {
             return Err(ProviderError::Parse(

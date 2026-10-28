@@ -121,14 +121,14 @@ impl AmpProvider {
             .get("completionsUsed")
             .or_else(|| json.get("used"))
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| ProviderError::Parse("Amp usage counter missing".into()))?;
+            .ok_or_else(|| ProviderError::Parse("Amp response contains no usage counter".into()))?;
 
         let limit = json
             .get("completionsLimit")
             .or_else(|| json.get("limit"))
             .and_then(|v| v.as_f64())
             .filter(|limit| *limit > 0.0)
-            .ok_or_else(|| ProviderError::Parse("Amp usage limit missing or invalid".into()))?;
+            .ok_or_else(|| ProviderError::Parse("Amp response contains no valid usage limit".into()))?;
 
         let used_percent = (used / limit) * 100.0;
 
