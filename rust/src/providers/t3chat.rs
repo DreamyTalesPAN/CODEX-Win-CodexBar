@@ -127,7 +127,7 @@ impl T3ChatProvider {
         }
 
         let customer = Self::parse_json_lines(&body)?;
-        Ok(Self::usage_from_customer_data(customer))
+        Self::usage_from_customer_data(customer)
     }
 
     fn resolve_request_context(
@@ -237,7 +237,7 @@ impl T3ChatProvider {
         ))
     }
 
-    fn usage_from_customer_data(customer: T3CustomerData) -> UsageSnapshot {
+    fn usage_from_customer_data(customer: T3CustomerData) -> Result<UsageSnapshot, ProviderError> {
         let base_reset = date_from_epoch(customer.usage_four_hour_next_reset_at)
             .or_else(|| date_from_epoch(customer.usage_window_next_reset_at));
         let overage_reset = customer
@@ -249,28 +249,40 @@ impl T3ChatProvider {
             _ => "Base".to_string(),
         };
 
-        let primary = RateWindow::with_details(
-            percent(customer.usage_four_hour_percentage),
-            Some(4 * 60),
-            base_reset,
-            Some(base_description),
+        let primary = customer.usage_four_hour_percentage.map(|percent| {
+            RateWindow::with_details(
+                percent.clamp(0.0, 100.0),
+                Some(4 * 60),
+                base_reset,
+                Some(base_description),
+            )
+        });
+        let secondary = customer
+            .usage_month_percentage
+            .or(customer.usage_period_percentage)
+            .map(|percent| {
+                RateWindow::with_details(
+                    percent.clamp(0.0, 100.0),
+                    None,
+                    overage_reset,
+                    Some("Overage".into()),
+                )
+            });
+        if primary.is_none() && secondary.is_none() {
+            return Err(ProviderError::Parse(
+                "T3 Chat response contains no usage percentages".into(),
+            ));
+        }
+        let mut usage = UsageSnapshot::new(
+            primary.unwrap_or_else(|| RateWindow::informational("Base usage unavailable")),
         );
-        let secondary = RateWindow::with_details(
-            percent(
-                customer
-                    .usage_month_percentage
-                    .or(customer.usage_period_percentage),
-            ),
-            None,
-            overage_reset,
-            Some("Overage".to_string()),
-        );
-
-        let mut usage = UsageSnapshot::new(primary).with_secondary(secondary);
+        if let Some(secondary) = secondary {
+            usage = usage.with_secondary(secondary);
+        }
         if let Some(plan) = plan_name(&customer) {
             usage = usage.with_login_method(plan);
         }
-        usage
+        Ok(usage)
     }
 }
 
@@ -319,10 +331,6 @@ fn find_customer_data(value: &serde_json::Value) -> Option<&serde_json::Value> {
         serde_json::Value::Array(values) => values.iter().find_map(find_customer_data),
         _ => None,
     }
-}
-
-fn percent(value: Option<f64>) -> f64 {
-    value.unwrap_or(0.0).clamp(0.0, 100.0)
 }
 
 fn date_from_epoch(value: Option<f64>) -> Option<DateTime<Utc>> {
@@ -426,7 +434,7 @@ mod tests {
     #[test]
     fn maps_customer_data_to_windows() {
         let customer = T3ChatProvider::parse_json_lines(SAMPLE_RESPONSE.as_bytes()).unwrap();
-        let usage = T3ChatProvider::usage_from_customer_data(customer);
+        let usage = T3ChatProvider::usage_from_customer_data(customer).expect("usage");
         assert_eq!(usage.primary.used_percent, 12.5);
         assert_eq!(usage.primary.window_minutes, Some(240));
         assert_eq!(
@@ -456,5 +464,32 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name == "X-Deployment-Id" && value == "dpl_test")
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
+        T3ChatProvider::usage_from_customer_data(serde_json::from_value(value).unwrap())
+    }
+    #[test]
+    fn missing_usage_is_an_error() {
+        assert!(parse(json!({"subscription":{},"usageBand":"base"})).is_err());
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = parse(json!({"usageFourHourPercentage":0})).unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
+        assert!(snapshot.secondary.is_none());
+    }
+    #[test]
+    fn overage_only_keeps_primary_unavailable() {
+        let snapshot = parse(json!({"usageMonthPercentage":25})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(snapshot.secondary.unwrap().used_percent, 25.0);
     }
 }
