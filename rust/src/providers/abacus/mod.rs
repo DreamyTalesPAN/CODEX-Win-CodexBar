@@ -41,6 +41,18 @@ struct BillingInfo {
     current_tier: Option<String>,
 }
 
+fn parse_compute_response(body: &str) -> Result<ComputePoints, ProviderError> {
+    let env: ApiEnvelope<ComputePoints> = serde_json::from_str(body)
+        .map_err(|_| ProviderError::Parse("Abacus compute response is invalid".into()))?;
+
+    if !env.success {
+        return Err(ProviderError::AuthRequired);
+    }
+    env.result.ok_or_else(|| {
+        ProviderError::Parse("Abacus response contains no compute points result".into())
+    })
+}
+
 pub struct AbacusProvider {
     metadata: ProviderMetadata,
     client: Client,
@@ -129,14 +141,7 @@ impl AbacusProvider {
         }
 
         let body = resp.text().await?;
-        let env: ApiEnvelope<ComputePoints> = serde_json::from_str(&body)
-            .map_err(|e| ProviderError::Parse(format!("Failed to parse compute points: {}", e)))?;
-
-        if !env.success {
-            return Err(ProviderError::AuthRequired);
-        }
-        env.result
-            .ok_or_else(|| ProviderError::Parse("Missing compute points result".to_string()))
+        parse_compute_response(&body)
     }
 
     async fn fetch_billing(&self, cookie_header: &str) -> Option<BillingInfo> {
@@ -379,5 +384,32 @@ mod p1_11_zero_denominator_is_information_tests {
         assert!(snapshot.primary.is_informational);
         assert!(snapshot.primary.window_minutes.is_none());
         assert!(snapshot.primary.resets_at.is_none());
+    }
+}
+
+#[cfg(test)]
+mod p2_02_incomplete_compute_is_a_data_error_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_02_incomplete_compute_is_a_data_error() {
+        for body in [
+            r#"{"success":true,"result":{"totalComputePoints":100}}"#,
+            r#"{"success":true}"#,
+        ] {
+            let error = parse_compute_response(body).unwrap_err();
+            assert!(matches!(error, ProviderError::Parse(_)));
+            let text = error.to_string().to_lowercase();
+            for marker in [
+                "missing",
+                "not found",
+                "required",
+                "auth",
+                "token",
+                "cookie",
+                "login",
+            ] {
+                assert!(!text.contains(marker), "{text}");
+            }
+        }
     }
 }

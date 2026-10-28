@@ -1019,3 +1019,25 @@ mod p1_17_weekly_only_preserves_zero_and_nonzero_usage_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod p2_02_empty_usage_is_a_data_error_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_02_empty_usage_is_a_data_error() {
+        let error = OpenCodeGoProvider::parse_usage_text("{}").unwrap_err();
+        assert!(matches!(error, ProviderError::Parse(_)));
+        let text = error.to_string().to_lowercase();
+        for marker in [
+            "missing",
+            "not found",
+            "required",
+            "auth",
+            "token",
+            "cookie",
+            "login",
+        ] {
+            assert!(!text.contains(marker), "{text}");
+        }
+    }
+}

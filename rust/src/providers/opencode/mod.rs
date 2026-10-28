@@ -225,7 +225,7 @@ impl OpenCodeProvider {
                     has_usage_hint,
                     "OpenCode subscription body missing rolling/weekly usage windows"
                 );
-                ProviderError::Parse("Missing usage percent (rolling or weekly)".into())
+                ProviderError::Parse("OpenCode response contains no usable usage windows".into())
             })
     }
 
@@ -870,5 +870,29 @@ mod tests {
             ),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod p2_02_empty_usage_is_a_data_error_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_02_empty_usage_is_a_data_error() {
+        let error = OpenCodeProvider::new()
+            .parse_subscription("{}")
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Parse(_)));
+        let text = error.to_string().to_lowercase();
+        for marker in [
+            "missing",
+            "not found",
+            "required",
+            "auth",
+            "token",
+            "cookie",
+            "login",
+        ] {
+            assert!(!text.contains(marker), "{text}");
+        }
     }
 }
