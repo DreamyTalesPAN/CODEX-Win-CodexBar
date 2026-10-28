@@ -727,55 +727,43 @@ pub(crate) fn snapshot_from_credit_status(
     account_email: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<UsageSnapshot, ProviderError> {
-    let (used_credit, budget_cap) = status
-        .used_credit
-        .filter(|used| used.is_finite())
-        .zip(
-            status
-                .budget_cap
-                .filter(|limit| limit.is_finite() && *limit > 0.0),
-        )
-        .ok_or_else(|| {
-            ProviderError::Parse("ZoomMate response contains no usable credit quota".into())
-        })?;
-    let is_unlimited = status.is_unlimited.unwrap_or(false);
-
-    let used_percent = if is_unlimited {
-        0.0
+    let primary = if status.is_unlimited.unwrap_or(false) {
+        RateWindow::informational("Unlimited credits")
     } else {
-        ((used_credit / budget_cap) * 100.0).clamp(0.0, 100.0)
-    };
-
-    let cycle_start = date_from_millis(status.cycle_start_date);
-    let cycle_end = date_from_millis(status.cycle_end_date);
-
-    let resets_at = if is_unlimited || budget_cap <= 0.0 {
-        None
-    } else {
-        cycle_end
-    };
-
-    let window_minutes = match (cycle_start, cycle_end) {
-        (Some(start), Some(end)) if end > start => {
-            let mins = (end - start).num_minutes();
-            if mins > 0 {
-                // Window length is clamped to u32::MAX, so the cast cannot truncate.
-                #[expect(clippy::cast_possible_truncation, reason = "clamped to u32 range")]
-                let window = mins.min(u32::MAX as i64) as u32;
-                Some(window)
-            } else {
-                None
+        let (used_credit, budget_cap) = status
+            .used_credit
+            .filter(|used| used.is_finite())
+            .zip(
+                status
+                    .budget_cap
+                    .filter(|limit| limit.is_finite() && *limit > 0.0),
+            )
+            .ok_or_else(|| {
+                ProviderError::Parse("ZoomMate response contains no usable credit quota".into())
+            })?;
+        let cycle_start = date_from_millis(status.cycle_start_date);
+        let cycle_end = date_from_millis(status.cycle_end_date);
+        let window_minutes = match (cycle_start, cycle_end) {
+            (Some(start), Some(end)) if end > start => {
+                let mins = (end - start).num_minutes();
+                if mins > 0 {
+                    // Window length is clamped to u32::MAX, so the cast cannot truncate.
+                    #[expect(clippy::cast_possible_truncation, reason = "clamped to u32 range")]
+                    let window = mins.min(u32::MAX as i64) as u32;
+                    Some(window)
+                } else {
+                    None
+                }
             }
-        }
-        _ => None,
+            _ => None,
+        };
+        RateWindow::with_details(
+            ((used_credit / budget_cap) * 100.0).clamp(0.0, 100.0),
+            window_minutes,
+            cycle_end,
+            Some("Credits".into()),
+        )
     };
-
-    let primary = RateWindow::with_details(
-        used_percent,
-        window_minutes,
-        resets_at,
-        Some("Credits".into()),
-    );
 
     let mut snap = UsageSnapshot::new(primary);
     snap.updated_at = now;
@@ -838,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_is_zero_but_zero_cap_is_unavailable() {
+    fn unlimited_is_information_and_zero_cap_is_unavailable() {
         let unlimited = CreditStatus {
             budget_cap: Some(100.0),
             used_credit: Some(50.0),
@@ -846,8 +834,16 @@ mod tests {
             ..Default::default()
         };
         let snap = snapshot_from_credit_status(&unlimited, None, Utc::now()).expect("quota");
-        assert_eq!(snap.primary.used_percent, 0.0);
+        assert!(snap.primary.is_informational);
         assert!(snap.primary.resets_at.is_none());
+
+        let unlimited_without_counters = CreditStatus {
+            is_unlimited: Some(true),
+            ..Default::default()
+        };
+        let snap = snapshot_from_credit_status(&unlimited_without_counters, None, Utc::now())
+            .expect("unlimited is a state, not missing data");
+        assert!(snap.primary.is_informational);
 
         let zero_cap = CreditStatus {
             budget_cap: Some(0.0),
