@@ -112,7 +112,13 @@ impl DeepInfraSnapshot {
             .filter(|limit| *limit > 0.0 && limit.is_finite())
         {
             Some(limit) => RateWindow::with_details(
-                (self.recent_cost_usd / limit * 100.0).clamp(0.0, 100.0),
+                // Upstream #2822: balance depletion stays the hard 100 % signal.
+                if self.suspended || self.amount_owed_usd > 0.0 || self.available_balance_usd <= 0.0
+                {
+                    100.0
+                } else {
+                    (self.recent_cost_usd / limit * 100.0).clamp(0.0, 100.0)
+                },
                 None,
                 None,
                 Some(detail),
@@ -483,6 +489,20 @@ mod section_b_tests {
         .to_usage_snapshot();
         assert!(!snapshot.primary.is_informational);
         assert_eq!(snapshot.primary.used_percent, 0.0);
+    }
+
+    #[test]
+    fn depleted_or_suspended_account_with_a_limit_stays_exhausted() {
+        for checklist in [
+            r#"{"stripe_balance":2,"recent":1,"limit":10}"#,
+            r#"{"stripe_balance":-20,"recent":1,"limit":10,"suspended":true}"#,
+        ] {
+            let snapshot = parse_snapshot_for_testing(checklist, r#"{"months":[]}"#)
+                .unwrap()
+                .to_usage_snapshot();
+            assert!(!snapshot.primary.is_informational, "{checklist}");
+            assert_eq!(snapshot.primary.used_percent, 100.0, "{checklist}");
+        }
     }
 
     #[test]
