@@ -87,22 +87,6 @@ impl DeepInfraSnapshot {
     }
 
     fn to_usage_snapshot(&self) -> UsageSnapshot {
-        // Upstream #2822: with a positive spending limit configured, the
-        // primary percent reflects billing-cycle spend against that limit so
-        // the automatic menu-bar metric tracks it; balance-depletion stays
-        // the hard 100% signal.
-        let used_percent =
-            if self.suspended || self.amount_owed_usd > 0.0 || self.available_balance_usd <= 0.0 {
-                100.0
-            } else if let Some(limit) = self
-                .spending_limit_usd
-                .filter(|limit| *limit > 0.0 && limit.is_finite())
-            {
-                ((self.recent_cost_usd / limit) * 100.0).clamp(0.0, 100.0)
-            } else {
-                0.0
-            };
-
         let balance_text = if self.amount_owed_usd > 0.0 {
             format!("${:.2} owed", self.amount_owed_usd)
         } else {
@@ -123,8 +107,18 @@ impl DeepInfraSnapshot {
             format!("{balance_text} · {spending_text}")
         };
 
-        let mut primary = RateWindow::new(used_percent);
-        primary.reset_description = Some(detail);
+        let primary = match self
+            .spending_limit_usd
+            .filter(|limit| *limit > 0.0 && limit.is_finite())
+        {
+            Some(limit) => RateWindow::with_details(
+                (self.recent_cost_usd / limit * 100.0).clamp(0.0, 100.0),
+                None,
+                None,
+                Some(detail),
+            ),
+            None => RateWindow::informational(detail),
+        };
 
         UsageSnapshot::new(primary).with_login_method(balance_text)
     }
@@ -364,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn spend_over_limit_clamps_to_100_and_zero_limit_stays_binary() {
+    fn spend_over_limit_clamps_to_100_and_zero_limit_is_informational() {
         // Spend beyond the positive limit clamps at 100% instead of exceeding.
         let snapshot = parse_snapshot_for_testing(
             &checklist_json(-50.0, 30.0, Some(20.0), false, None),
@@ -373,13 +367,13 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.to_usage_snapshot().primary.used_percent, 100.0);
 
-        // No (or non-positive) limit keeps the legacy binary balance signal.
+        // Without a positive limit, balance is information rather than a quota.
         let snapshot = parse_snapshot_for_testing(
             &checklist_json(-50.0, 1.0, Some(0.0), false, None),
             &usage_json(100.0),
         )
         .unwrap();
-        assert_eq!(snapshot.to_usage_snapshot().primary.used_percent, 0.0);
+        assert!(snapshot.to_usage_snapshot().primary.is_informational);
     }
 
     #[test]
@@ -395,7 +389,7 @@ mod tests {
         assert_eq!(snapshot.spending_limit_usd, None);
 
         let usage = snapshot.to_usage_snapshot();
-        assert_eq!(usage.primary.used_percent, 100.0);
+        assert!(usage.primary.is_informational);
         assert_eq!(
             usage.primary.reset_description.as_deref(),
             Some("$9.75 owed · $6.50 spent this month")
@@ -404,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn suspended_account_is_marked_exhausted() {
+    fn suspended_account_is_reported_without_a_quota() {
         let snapshot = parse_snapshot_for_testing(
             &checklist_json(-5.0, 1.0, None, true, Some("Payment review")),
             &usage_json(100.0),
@@ -412,7 +406,7 @@ mod tests {
         .unwrap()
         .to_usage_snapshot();
 
-        assert_eq!(snapshot.primary.used_percent, 100.0);
+        assert!(snapshot.primary.is_informational);
         assert!(
             snapshot
                 .primary
@@ -457,5 +451,42 @@ mod tests {
         );
         assert!(!provider.metadata().supports_credits);
         assert!(!provider.metadata().default_enabled);
+    }
+}
+
+#[cfg(test)]
+mod section_b_tests {
+    use super::*;
+
+    #[test]
+    fn balance_without_limit_is_informational() {
+        for (balance, recent, suspended) in
+            [(-20.0, 3.0, false), (2.0, 1.0, false), (-20.0, 0.0, true)]
+        {
+            let checklist = serde_json::json!({"stripe_balance": balance, "recent": recent, "suspended": suspended});
+            let snapshot = parse_snapshot_for_testing(&checklist.to_string(), r#"{"months":[]}"#)
+                .unwrap()
+                .to_usage_snapshot();
+            assert!(snapshot.primary.is_informational);
+            assert!(snapshot.primary.window_minutes.is_none());
+            assert!(snapshot.primary.resets_at.is_none());
+        }
+    }
+
+    #[test]
+    fn actual_zero_over_limit_remains_quota() {
+        let snapshot = parse_snapshot_for_testing(
+            r#"{"stripe_balance":-20,"recent":0,"limit":10}"#,
+            r#"{"months":[]}"#,
+        )
+        .unwrap()
+        .to_usage_snapshot();
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+    }
+
+    #[test]
+    fn missing_billing_fields_are_rejected() {
+        assert!(parse_snapshot_for_testing(r#"{"limit":10}"#, r#"{"months":[]}"#).is_err());
     }
 }

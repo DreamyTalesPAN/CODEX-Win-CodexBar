@@ -282,18 +282,15 @@ fn aggregate_summaries(
 }
 
 fn snapshot_from_summary(summary: &DeepgramUsageSummary) -> UsageSnapshot {
-    let mut primary = RateWindow::new(0.0);
-    primary.reset_description = Some(format!("{} requests", format_count(summary.requests)));
+    let primary = RateWindow::informational(format!("{} requests", format_count(summary.requests)));
 
-    let mut secondary = RateWindow::new(0.0);
-    secondary.reset_description = Some(format!(
+    let secondary = RateWindow::informational(format!(
         "{} audio hours / {} billable hours",
         format_decimal(summary.hours),
         format_decimal(summary.total_hours)
     ));
 
-    let mut tertiary = RateWindow::new(0.0);
-    tertiary.reset_description = Some(format!(
+    let tertiary = RateWindow::informational(format!(
         "{} tokens / {} TTS chars",
         format_count(summary.tokens_in + summary.tokens_out),
         format_count(summary.tts_characters)
@@ -415,5 +412,28 @@ mod tests {
             Some("10 requests")
         );
         assert_eq!(snapshot.login_method.as_deref(), Some("Project: Prod"));
+    }
+}
+
+#[cfg(test)]
+mod cx289b_tests {
+    use super::*;
+    #[test]
+    fn counters_without_quota_are_informational() {
+        let project = Project {
+            project_id: "synthetic".into(),
+            name: None,
+        };
+        for raw in [
+            "{}",
+            r#"{"results":[{"requests":0,"tokens_in":0,"tokens_out":0,"hours":0,"total_hours":0,"tts_characters":0}]}"#,
+            r#"{"results":[{"requests":10,"tokens_in":100,"tokens_out":50,"hours":2,"total_hours":3,"tts_characters":1000}]}"#,
+        ] {
+            let usage: UsageResponse = serde_json::from_str(raw).unwrap();
+            let snapshot = snapshot_from_summary(&summary_from_usage(&project, &usage));
+            assert!(snapshot.primary.is_informational);
+            assert!(snapshot.secondary.unwrap().is_informational);
+            assert!(snapshot.tertiary.unwrap().is_informational);
+        }
     }
 }
