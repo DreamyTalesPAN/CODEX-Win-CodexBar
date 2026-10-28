@@ -78,7 +78,7 @@ impl Provider for LiteLLMProvider {
                 let value: Value = response.json().await.map_err(|e| {
                     ProviderError::Parse(format!("Failed to parse LiteLLM key/info: {e}"))
                 })?;
-                Ok(result_from_key_info(&value))
+                result_from_key_info(&value)
             }
             SourceMode::Web | SourceMode::Cli => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
@@ -131,47 +131,59 @@ fn management_url(base: &str, path: &str) -> Result<Url, ProviderError> {
         .map_err(|e| ProviderError::Other(format!("Invalid LiteLLM URL: {e}")))
 }
 
-fn result_from_key_info(value: &Value) -> ProviderFetchResult {
+fn result_from_key_info(value: &Value) -> Result<ProviderFetchResult, ProviderError> {
     let root = value
         .get("info")
         .or_else(|| value.get("key"))
         .unwrap_or(value);
-    let spend = number(root, &["spend", "spend_usd", "spendUSD"]).unwrap_or(0.0);
+    let spend = number(root, &["spend", "spend_usd", "spendUSD"]);
     let limit = number(root, &["max_budget", "maxBudget", "budget", "limit"]);
-    let percent = limit
-        .filter(|v| *v > 0.0)
-        .map_or(0.0, |limit| spend / limit * 100.0);
-    let mut primary = RateWindow::new(percent);
-    if let Some(limit) = limit.filter(|value| *value > 0.0) {
-        primary.reset_description = Some(budget_detail(spend, limit));
+    let primary = match (spend, limit.filter(|v| *v > 0.0)) {
+        (Some(spend), Some(limit)) => RateWindow::with_details(
+            spend / limit * 100.0,
+            None,
+            None,
+            Some(budget_detail(spend, limit)),
+        ),
+        _ => RateWindow::informational("Key budget usage unavailable"),
+    };
+    let mut snapshot = UsageSnapshot::new(primary);
+    if let Some(spend) = spend {
+        snapshot = snapshot.with_login_method(format!("Spend ${spend:.2}"));
     }
-    let mut snapshot = UsageSnapshot::new(primary).with_login_method(format!("Spend ${spend:.2}"));
     if let Some(team) = root.get("team_info").or_else(|| root.get("teamInfo"))
         && let Some(team_spend) = number(team, &["spend", "team_spend", "teamSpend"])
     {
         let team_limit = number(team, &["max_budget", "budget", "limit"]);
-        let team_percent = team_limit
-            .filter(|v| *v > 0.0)
-            .map_or(0.0, |limit| team_spend / limit * 100.0);
-        let mut team_window = RateWindow::new(team_percent);
-        if let Some(team_limit) = team_limit.filter(|value| *value > 0.0) {
+        let team_window = if let Some(team_limit) = team_limit.filter(|value| *value > 0.0) {
             let alias = string(team, &["team_alias", "teamAlias", "alias"])
                 .map(|value| format!("Team {value}: "))
                 .unwrap_or_default();
-            team_window.reset_description =
-                Some(format!("{alias}{}", budget_detail(team_spend, team_limit)));
-        }
+            RateWindow::with_details(
+                team_spend / team_limit * 100.0,
+                None,
+                None,
+                Some(format!("{alias}{}", budget_detail(team_spend, team_limit))),
+            )
+        } else {
+            RateWindow::informational(format!("Team spend ${team_spend:.2}"))
+        };
         snapshot = snapshot.with_extra_rate_window("team", "Team budget", team_window);
     }
+    if spend.is_none() && snapshot.extra_rate_windows.is_empty() {
+        return Err(ProviderError::Parse(
+            "LiteLLM response contains no usage data".into(),
+        ));
+    }
     let mut result = ProviderFetchResult::new(snapshot, "api");
-    if spend > 0.0 {
+    if let Some(spend) = spend {
         let mut cost = CostSnapshot::new(spend, "USD", "Spend");
         if let Some(limit) = limit {
             cost = cost.with_limit(limit);
         }
         result = result.with_cost(cost);
     }
-    result
+    Ok(result)
 }
 
 fn number(value: &Value, keys: &[&str]) -> Option<f64> {
@@ -198,7 +210,8 @@ mod tests {
     #[test]
     fn parses_spend_budget() {
         let result =
-            result_from_key_info(&serde_json::json!({"info":{"spend":25.0,"max_budget":100.0}}));
+            result_from_key_info(&serde_json::json!({"info":{"spend":25.0,"max_budget":100.0}}))
+                .unwrap();
         assert_eq!(result.usage.primary.used_percent, 25.0);
         assert_eq!(
             result.usage.primary.reset_description.as_deref(),
@@ -216,7 +229,8 @@ mod tests {
                     "max_budget": 1000.0
                 }
             }
-        }));
+        }))
+        .unwrap();
         assert_eq!(result.usage.extra_rate_windows.len(), 1);
         assert_eq!(
             result.usage.extra_rate_windows[0]
@@ -242,5 +256,38 @@ mod tests {
         let (base, key) = resolve_base_and_key(&ctx).unwrap();
         assert_eq!(base, "https://litellm.example.com");
         assert_eq!(key, "sk-app");
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    fn build(value: Value) -> Result<ProviderFetchResult, ProviderError> {
+        result_from_key_info(&value)
+    }
+    #[test]
+    fn cx289a_missing_spend_is_error() {
+        for value in [json!({}), json!({"max_budget":100})] {
+            assert!(build(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn cx289a_spend_only_is_informational() {
+        let result = build(json!({"spend":12})).unwrap();
+        assert!(result.usage.primary.is_informational);
+        assert_eq!(result.cost.unwrap().used, 12.0);
+    }
+    #[test]
+    fn cx289a_team_only_keeps_unknown_primary() {
+        let result = build(json!({"team_info":{"spend":0,"max_budget":100}})).unwrap();
+        assert!(result.usage.primary.is_informational);
+        assert!(!result.usage.extra_rate_windows[0].window.is_informational);
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        let result = build(json!({"spend":0,"max_budget":100})).unwrap();
+        assert!(!result.usage.primary.is_informational);
+        assert_eq!(result.usage.primary.used_percent, 0.0);
     }
 }
