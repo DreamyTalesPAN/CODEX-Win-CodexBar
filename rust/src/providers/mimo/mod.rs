@@ -231,7 +231,7 @@ fn snapshot_from_parts(
         .and_then(parse_mimo_date);
 
     let item = usage_item
-        .ok_or_else(|| ProviderError::Parse("MiMo response contains no token-plan usage".into()))?;
+        .ok_or_else(|| ProviderError::Parse("MiMo response contains no plan usage".into()))?;
     let primary = RateWindow::with_details(
         item.percent,
         RateWindow::monthly_window_minutes(period_end),

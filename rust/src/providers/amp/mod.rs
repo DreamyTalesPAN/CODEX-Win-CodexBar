@@ -154,7 +154,7 @@ impl AmpProvider {
 
     fn configured_usage() -> Result<UsageSnapshot, ProviderError> {
         Err(ProviderError::Parse(
-            "Amp is configured, but usage is unavailable".into(),
+            "Amp response contains no usage data".into(),
         ))
     }
 

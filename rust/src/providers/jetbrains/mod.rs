@@ -147,7 +147,7 @@ impl JetBrainsProvider {
 
     fn usage_from_quota(quota: JetBrainsQuota) -> Result<UsageSnapshot, ProviderError> {
         let percent = quota.used_percent().ok_or_else(|| {
-            ProviderError::Parse("JetBrains config contains no usable credit quota".into())
+            ProviderError::Parse("JetBrains quota data contains no usable credit quota".into())
         })?;
         Ok(UsageSnapshot::new(RateWindow::new(percent)).with_login_method("JetBrains AI"))
     }

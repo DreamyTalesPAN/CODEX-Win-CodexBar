@@ -711,7 +711,7 @@ impl MiniMaxProvider {
 
     fn configured_usage() -> Result<UsageSnapshot, ProviderError> {
         Err(ProviderError::Parse(
-            "MiniMax is configured but has no usage data".into(),
+            "MiniMax response contains no usage data".into(),
         ))
     }
 
