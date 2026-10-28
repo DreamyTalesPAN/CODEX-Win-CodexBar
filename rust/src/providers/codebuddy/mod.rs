@@ -504,12 +504,15 @@ fn totals_from_api_payload(value: &Value) -> Result<CreditTotals, ProviderError>
             .ok_or_else(|| {
                 ProviderError::Parse("CodeBuddy response contains no package total".into())
             })?;
-        let totals = CreditTotals::normalized(
-            account_total,
-            precise_or_field(account, "CapacityUsedPrecise", "CapacityUsed"),
-            precise_or_field(account, "CapacityRemainPrecise", "CapacityRemain"),
-            None,
-        )?;
+        let account_used = precise_or_field(account, "CapacityUsedPrecise", "CapacityUsed");
+        let account_remaining =
+            precise_or_field(account, "CapacityRemainPrecise", "CapacityRemain");
+        // A fully known empty package contributes nothing to the aggregate.
+        if account_total == 0.0 && account_used == Some(0.0) && account_remaining == Some(0.0) {
+            continue;
+        }
+        let totals =
+            CreditTotals::normalized(account_total, account_used, account_remaining, None)?;
         total += totals.total;
         used += totals.used;
         remaining += totals.remaining;
@@ -1293,6 +1296,36 @@ mod cx289a_tests {
     fn payload(accounts: Value) -> Value {
         json!({"code":0,"data":{"Response":{"Data":{"Accounts":accounts}}}})
     }
+    #[test]
+    fn review16_empty_package_preserves_known_aggregate() {
+        let totals = totals_from_api_payload(&payload(json!([
+            {"CapacitySize":100,"CapacityUsed":25,"CapacityRemain":75},
+            {"CapacitySize":0,"CapacityUsed":0,"CapacityRemain":0}
+        ])))
+        .unwrap();
+        let snapshot = snapshot_from_totals(&totals);
+        assert_eq!(snapshot.primary.used_percent, 25.0);
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(totals.remaining, 75.0);
+    }
+
+    #[test]
+    fn review16_empty_package_alone_does_not_invent_quota() {
+        assert!(
+            totals_from_api_payload(&payload(json!([
+                {"CapacitySize":0,"CapacityUsed":0,"CapacityRemain":0}
+            ])))
+            .is_err()
+        );
+        assert!(
+            totals_from_api_payload(&payload(json!([
+                {"CapacitySize":100,"CapacityUsed":25,"CapacityRemain":75},
+                {"CapacitySize":0}
+            ])))
+            .is_err()
+        );
+    }
+
     #[test]
     fn cx289a_missing_api_counter_is_rejected() {
         assert!(totals_from_api_payload(&payload(json!([{"CapacitySize":100}]))).is_err());
