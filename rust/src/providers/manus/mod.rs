@@ -193,13 +193,13 @@ fn snapshot_from_credits(credits: &ManusCreditsResponse) -> Result<UsageSnapshot
     }
 
     if credits.addon_credits > 0.0 {
-        let mut addon = RateWindow::new(0.0);
-        addon.reset_description = Some(format!("{:.0} add-on credits", credits.addon_credits));
+        let addon =
+            RateWindow::informational(format!("{:.0} add-on credits", credits.addon_credits));
         snapshot = snapshot.with_extra_rate_window("addon", "Add-on credits", addon);
     }
     if credits.event_credits > 0.0 {
-        let mut event = RateWindow::new(0.0);
-        event.reset_description = Some(format!("{:.0} event credits", credits.event_credits));
+        let event =
+            RateWindow::informational(format!("{:.0} event credits", credits.event_credits));
         snapshot = snapshot.with_extra_rate_window("event", "Event credits", event);
     }
     Ok(snapshot)
@@ -285,6 +285,23 @@ mod cx289a_tests {
         let snap = build(json!({"maxRefreshCredits":100,"refreshCredits":100})).unwrap();
         assert!(snap.primary.is_informational);
         assert_eq!(snap.secondary.unwrap().used_percent, 0.0);
+    }
+    #[test]
+    fn addon_and_event_balances_are_information_not_zero_percent() {
+        let snap = build(json!({
+            "proMonthlyCredits":100,"periodicCredits":100,
+            "addonCredits":40,"eventCredits":7
+        }))
+        .unwrap();
+        for id in ["addon", "event"] {
+            let window = &snap
+                .extra_rate_windows
+                .iter()
+                .find(|w| w.id == id)
+                .unwrap_or_else(|| panic!("{id} window"))
+                .window;
+            assert!(window.is_informational, "{id}");
+        }
     }
     #[test]
     fn cx289a_real_zero_is_quota() {
