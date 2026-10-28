@@ -468,7 +468,7 @@ fn parse_resets_at_from_time_range(
             re.replace_all(end_part, "").trim().to_string()
         };
         let time = chrono::NaiveTime::parse_from_str(&end_clean, "%H:%M").ok()?;
-        let today = now.date_naive();
+        let today = now.with_timezone(&tz).date_naive();
         let dt = today.and_time(time).and_local_timezone(tz).single()?;
         let mut candidate = dt.with_timezone(&Utc);
         if candidate < now {
@@ -984,5 +984,19 @@ mod tests {
         assert!(is_token_plan_without_coding_plan(&ProviderError::Other(
             "No Active Token Plan Subscription".to_string()
         )));
+    }
+}
+
+#[cfg(test)]
+mod p2_01_reset_uses_timezone_calendar_date_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_01_reset_uses_timezone_calendar_date() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 18, 0, 0).unwrap();
+        let expected = Utc.with_ymd_and_hms(2026, 10, 29, 17, 0, 0).unwrap();
+        assert_eq!(
+            parse_resets_at_from_time_range("20:00-01:00(UTC+8)", "5 hours", now),
+            Some(expected)
+        );
     }
 }

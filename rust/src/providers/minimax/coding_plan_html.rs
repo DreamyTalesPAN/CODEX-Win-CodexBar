@@ -265,7 +265,7 @@ fn date_for_time(time: &str, tz_hint: Option<&str>, now: DateTime<Utc>) -> Optio
         None => FixedOffset::east_opt(0).unwrap(),
     };
     let time_only = chrono::NaiveTime::parse_from_str(time.trim(), "%H:%M").ok()?;
-    let today = now.date_naive();
+    let today = now.with_timezone(&tz).date_naive();
     let dt = today.and_time(time_only).and_local_timezone(tz).single()?;
     let mut candidate = dt.with_timezone(&Utc);
     if candidate < now {
@@ -651,5 +651,17 @@ mod p1_14_unlimited_is_information_in_every_slot_tests {
             assert!(window.resets_at.is_none());
             assert!(window.window_minutes.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod p2_01_html_reset_uses_timezone_calendar_date_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_01_html_reset_uses_timezone_calendar_date() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 18, 0, 0).unwrap();
+        let expected = Utc.with_ymd_and_hms(2026, 10, 29, 17, 0, 0).unwrap();
+        assert_eq!(date_for_time("01:00", Some("UTC+8"), now), Some(expected));
     }
 }
