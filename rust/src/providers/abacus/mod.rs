@@ -86,12 +86,17 @@ impl AbacusProvider {
             .and_then(|b| b.next_billing_date.as_deref())
             .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
             .map(|dt| dt.with_timezone(&Utc));
-        let primary = RateWindow::with_details(
-            percent,
-            RateWindow::monthly_window_minutes(resets_at).or(Some(FALLBACK_MONTHLY_WINDOW_MINUTES)),
-            resets_at,
-            Some(format_credit_detail(used, total)),
-        );
+        let primary = if total <= 0.0 {
+            RateWindow::informational(format_credit_detail(used, total))
+        } else {
+            RateWindow::with_details(
+                percent,
+                RateWindow::monthly_window_minutes(resets_at)
+                    .or(Some(FALLBACK_MONTHLY_WINDOW_MINUTES)),
+                resets_at,
+                Some(format_credit_detail(used, total)),
+            )
+        };
 
         let mut snapshot = UsageSnapshot::new(primary).with_primary_label(CREDITS_LABEL);
         if let Some(b) = billing
@@ -358,5 +363,21 @@ mod cx289a_tests {
         let snapshot = AbacusProvider::build_snapshot(compute, None).unwrap();
         assert_eq!(snapshot.primary.used_percent, 0.0);
         assert!(!snapshot.primary.is_informational);
+    }
+}
+
+#[cfg(test)]
+mod p1_11_zero_denominator_is_information_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_11_zero_denominator_is_information() {
+        let compute = serde_json::from_value(
+            serde_json::json!({"totalComputePoints":0,"computePointsLeft":0}),
+        )
+        .unwrap();
+        let snapshot = AbacusProvider::build_snapshot(compute, None).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert!(snapshot.primary.window_minutes.is_none());
+        assert!(snapshot.primary.resets_at.is_none());
     }
 }
