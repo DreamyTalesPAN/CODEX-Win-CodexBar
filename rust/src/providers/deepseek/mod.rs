@@ -261,8 +261,7 @@ impl DeepSeekProvider {
         let selected = select_balance_info(&balance.balance_infos).cloned();
 
         let Some(info) = selected else {
-            let mut window = RateWindow::new(100.0);
-            window.reset_description = Some("No balance information returned".to_string());
+            let window = RateWindow::informational("No balance information returned");
             return UsageSnapshot::new(window).with_login_method("Balance unavailable");
         };
 
@@ -271,11 +270,7 @@ impl DeepSeekProvider {
         let topped_up = parse_money(&info.topped_up_balance);
         let symbol = currency_symbol(&info.currency);
 
-        let mut window = RateWindow::new(if !balance.is_available || total <= 0.0 {
-            100.0
-        } else {
-            0.0
-        });
+        let mut window = RateWindow::informational("Balance unavailable");
 
         window.reset_description = if !balance.is_available {
             Some("Balance unavailable for API calls".to_string())
@@ -303,57 +298,42 @@ impl DeepSeekProvider {
             usage = usage.with_extra_rate_window(
                 "tokens-today",
                 "Tokens today",
-                RateWindow::with_details(
-                    0.0,
-                    Some(24 * 60),
-                    None,
-                    Some(format_count(summary.today_tokens)),
-                ),
+                RateWindow::informational(format_count(summary.today_tokens)),
             );
         }
         if summary.month_tokens > 0.0 {
             usage = usage.with_extra_rate_window(
                 "tokens-month",
                 "Tokens (month)",
-                RateWindow::with_details(0.0, None, None, Some(format_count(summary.month_tokens))),
+                RateWindow::informational(format_count(summary.month_tokens)),
             );
         }
         if summary.today_requests > 0.0 {
             usage = usage.with_extra_rate_window(
                 "requests-today",
                 "Requests today",
-                RateWindow::with_details(
-                    0.0,
-                    Some(24 * 60),
-                    None,
-                    Some(format_count(summary.today_requests)),
-                ),
+                RateWindow::informational(format_count(summary.today_requests)),
             );
         }
         if summary.month_requests > 0.0 {
             usage = usage.with_extra_rate_window(
                 "requests-month",
                 "Requests (month)",
-                RateWindow::with_details(
-                    0.0,
-                    None,
-                    None,
-                    Some(format_count(summary.month_requests)),
-                ),
+                RateWindow::informational(format_count(summary.month_requests)),
             );
         }
         if let Some(model) = summary.top_model.as_deref() {
             usage = usage.with_extra_rate_window(
                 "top-model",
                 "Top model",
-                RateWindow::with_details(0.0, None, None, Some(model.to_string())),
+                RateWindow::informational(model),
             );
         }
         for (idx, (category, tokens)) in summary.category_tokens.iter().take(3).enumerate() {
             usage = usage.with_extra_rate_window(
                 format!("category-{idx}"),
                 format!("Category: {}", category_label(category)),
-                RateWindow::with_details(0.0, None, None, Some(format_count(*tokens))),
+                RateWindow::informational(format_count(*tokens)),
             );
         }
         usage
@@ -695,7 +675,7 @@ mod tests {
             ],
         });
 
-        assert_eq!(snapshot.primary.used_percent, 100.0);
+        assert!(snapshot.primary.is_informational);
         assert_eq!(
             snapshot.primary.reset_description.as_deref(),
             Some("$0.00 — add credits at platform.deepseek.com")
@@ -704,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_when_balance_unavailable() {
+    fn reports_unavailable_balance_as_information() {
         let snapshot = DeepSeekProvider::snapshot_from_balance(BalanceResponse {
             is_available: false,
             balance_infos: vec![BalanceInfo {
@@ -715,7 +695,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(snapshot.primary.used_percent, 100.0);
+        assert!(snapshot.primary.is_informational);
         assert_eq!(
             snapshot.primary.reset_description.as_deref(),
             Some("Balance unavailable for API calls")
@@ -792,5 +772,47 @@ mod tests {
                 .iter()
                 .any(|window| window.title == "Top model")
         );
+    }
+}
+
+#[cfg(test)]
+mod section_b_tests {
+    use super::*;
+
+    #[test]
+    fn balances_and_missing_balance_are_not_quotas() {
+        for body in [
+            r#"{}"#,
+            r#"{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"10","granted_balance":"2","topped_up_balance":"8"}]}"#,
+            r#"{"is_available":false,"balance_infos":[{"currency":"USD","total_balance":"0","granted_balance":"0","topped_up_balance":"0"}]}"#,
+        ] {
+            let snapshot =
+                DeepSeekProvider::snapshot_from_balance(serde_json::from_str(body).unwrap());
+            assert!(snapshot.primary.is_informational, "{body}");
+            assert!(snapshot.primary.resets_at.is_none());
+        }
+    }
+
+    #[test]
+    fn activity_and_model_rows_are_informational() {
+        let summary = DeepSeekUsageSummary {
+            today_tokens: 2.0,
+            month_tokens: 5.0,
+            today_requests: 1.0,
+            month_requests: 3.0,
+            top_model: Some("deepseek-chat".into()),
+            category_tokens: vec![("input".into(), 2.0)],
+            ..Default::default()
+        };
+        let snapshot = DeepSeekProvider::apply_usage_summary(
+            UsageSnapshot::new(RateWindow::informational("Balance")),
+            &summary,
+        );
+        assert_eq!(snapshot.extra_rate_windows.len(), 6);
+        for row in snapshot.extra_rate_windows {
+            assert!(row.window.is_informational, "{}", row.id);
+            assert!(row.window.window_minutes.is_none());
+            assert!(row.window.resets_at.is_none());
+        }
     }
 }
