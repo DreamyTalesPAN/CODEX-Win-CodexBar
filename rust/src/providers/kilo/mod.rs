@@ -91,70 +91,57 @@ impl KiloProvider {
         credit_blocks_data: Option<&Value>,
         kilo_pass_data: Option<&Value>,
     ) -> Result<UsageSnapshot, ProviderError> {
-        // --- Credit blocks (primary window) ---
-        // `user.getCreditBlocks` returns an object wrapping a `creditBlocks`
-        // array plus a `totalBalance_mUsd` scalar (micro-USD). Accounts without
-        // a Kilo Pass subscription get an empty array; fall back to the general
-        // balance instead of rendering an empty $0.00 / $0.00 state (#355).
-        let mut total = 0.0_f64;
-        let mut remaining = 0.0_f64;
-        let mut has_blocks = false;
-
-        if let Some(payload) = credit_blocks_data {
-            let blocks = payload
+        // A balance alone does not establish the original credit allowance.
+        let blocks = credit_blocks_data.and_then(|payload| {
+            payload
                 .get("creditBlocks")
-                .and_then(|v| v.as_array())
-                .or_else(|| payload.as_array());
-
-            if let Some(arr) = blocks {
-                has_blocks = !arr.is_empty();
-                for block in arr {
-                    if let Ok(b) = serde_json::from_value::<CreditBlock>(block.clone()) {
-                        total += b.amount_m_usd.unwrap_or(0.0);
-                        remaining += b.balance_m_usd.unwrap_or(0.0);
-                    }
-                }
-            }
-
-            if !has_blocks
-                && let Some(balance_m_usd) =
-                    payload.get("totalBalance_mUsd").and_then(|v| v.as_f64())
-            {
-                total = balance_m_usd;
-                remaining = balance_m_usd;
-            }
-        }
-
-        let total_usd = total / 1_000_000.0;
-        let remaining_usd = remaining / 1_000_000.0;
-        let used_usd = (total_usd - remaining_usd).max(0.0);
-        let percent = if total_usd > 0.0 {
-            ((used_usd / total_usd) * 100.0).clamp(0.0, 100.0)
+                .and_then(Value::as_array)
+                .or_else(|| payload.as_array())
+        });
+        let totals = blocks
+            .filter(|blocks| !blocks.is_empty())
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .try_fold((0.0, 0.0), |(total, remaining), block| {
+                        let block = serde_json::from_value::<CreditBlock>(block.clone()).ok()?;
+                        Some((
+                            total + block.amount_m_usd?,
+                            remaining + block.balance_m_usd?,
+                        ))
+                    })
+            });
+        let primary = if let Some((total, remaining)) = totals.filter(|(total, _)| *total > 0.0) {
+            let used = (total - remaining).max(0.0);
+            RateWindow::with_details(
+                (used / total * 100.0).clamp(0.0, 100.0),
+                None,
+                None,
+                Some(format!(
+                    "${:.2}/${:.2}",
+                    used / 1_000_000.0,
+                    total / 1_000_000.0
+                )),
+            )
         } else {
-            0.0
+            RateWindow::informational("Credit usage unavailable")
         };
-
-        let mut primary = RateWindow::new(percent);
-        primary.reset_description = Some(format!("${:.2}/${:.2}", used_usd, total_usd));
 
         let mut snap = UsageSnapshot::new(primary);
 
         // --- Kilo Pass (secondary window) ---
         if let Some(pass) = kilo_pass_data {
-            let usage = pass
-                .get("currentPeriodUsageUsd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+            let usage = pass.get("currentPeriodUsageUsd").and_then(Value::as_f64);
             let base = pass
                 .get("currentPeriodBaseCreditsUsd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+                .and_then(Value::as_f64);
             let bonus = pass
                 .get("currentPeriodBonusCreditsUsd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let pass_total = base + bonus;
-            if pass_total > 0.0 {
+                .and_then(Value::as_f64);
+            if let (Some(usage), Some(base), Some(bonus)) = (usage, base, bonus)
+                && base + bonus > 0.0
+            {
+                let pass_total = base + bonus;
                 let pass_pct = ((usage / pass_total) * 100.0).clamp(0.0, 100.0);
                 let mut secondary = RateWindow::new(pass_pct);
                 secondary.reset_description = Some(format!("${:.2}/${:.2}", usage, pass_total));
@@ -172,6 +159,11 @@ impl KiloProvider {
             }
         }
 
+        if snap.primary.is_informational && snap.secondary.is_none() {
+            return Err(ProviderError::Parse(
+                "Kilo response contains no usable credit quota".into(),
+            ));
+        }
         Ok(snap)
     }
 
@@ -348,13 +340,11 @@ mod tests {
 
     #[test]
     fn handles_missing_credit_blocks() {
-        let snap = KiloProvider::build_snapshot(None, None).unwrap();
-        assert!((snap.primary.used_percent - 0.0).abs() < f64::EPSILON);
-        assert!(snap.secondary.is_none());
+        assert!(KiloProvider::build_snapshot(None, None).is_err());
     }
 
     #[test]
-    fn falls_back_to_balance_for_payg_without_pass() {
+    fn balance_without_allowance_is_not_a_quota() {
         // Pay-as-you-go account: empty creditBlocks, no Kilo Pass subscription.
         // Backs the "Remaining Credits" field on app.kilo.ai/profile (#355).
         let credit_blocks = serde_json::json!({
@@ -363,13 +353,52 @@ mod tests {
             "autoTopUpEnabled": false
         });
         let kilo_pass = serde_json::json!({ "subscription": null });
-        let snap = KiloProvider::build_snapshot(Some(&credit_blocks), Some(&kilo_pass)).unwrap();
-        // $1.06 balance, nothing used → 0% used, $0.00/$1.06 (used/total)
-        assert!((snap.primary.used_percent - 0.0).abs() < f64::EPSILON);
-        assert_eq!(
-            snap.primary.reset_description.as_deref(),
-            Some("$0.00/$1.06")
+        assert!(KiloProvider::build_snapshot(Some(&credit_blocks), Some(&kilo_pass)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cx289a_missing_quota_is_error() {
+        assert!(KiloProvider::build_snapshot(None, None).is_err());
+        for value in [
+            json!({"totalBalance_mUsd":100}),
+            json!({"creditBlocks":[{"amount_mUsd":100}]}),
+            json!({"creditBlocks":[{"balance_mUsd":100}]}),
+        ] {
+            assert!(
+                KiloProvider::build_snapshot(Some(&value), None).is_err(),
+                "{value}"
+            );
+        }
+    }
+    #[test]
+    fn cx289a_pass_missing_counter_is_error() {
+        assert!(
+            KiloProvider::build_snapshot(
+                None,
+                Some(&json!({"currentPeriodBaseCreditsUsd":100,"currentPeriodBonusCreditsUsd":0}))
+            )
+            .is_err()
         );
-        assert!(snap.secondary.is_none());
+    }
+    #[test]
+    fn cx289a_pass_only_keeps_unknown_primary() {
+        let snap = KiloProvider::build_snapshot(None, Some(&json!({"currentPeriodUsageUsd":0,"currentPeriodBaseCreditsUsd":100,"currentPeriodBonusCreditsUsd":0}))).unwrap();
+        assert!(snap.primary.is_informational);
+        assert_eq!(snap.secondary.unwrap().used_percent, 0.0);
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        let snap = KiloProvider::build_snapshot(
+            Some(&json!({"creditBlocks":[{"amount_mUsd":100,"balance_mUsd":100}]})),
+            None,
+        )
+        .unwrap();
+        assert!(!snap.primary.is_informational);
+        assert_eq!(snap.primary.used_percent, 0.0);
     }
 }
