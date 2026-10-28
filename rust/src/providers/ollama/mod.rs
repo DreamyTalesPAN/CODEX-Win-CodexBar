@@ -203,9 +203,8 @@ impl OllamaProvider {
 
         let response: TagsResponse = serde_json::from_slice(bytes)
             .map_err(|e| ProviderError::Parse(format!("Could not parse Ollama API tags: {e}")))?;
-        let mut primary = RateWindow::new(0.0);
-        primary.reset_description =
-            Some(format!("{} cloud models available", response.models.len()));
+        let primary =
+            RateWindow::informational(format!("{} cloud models available", response.models.len()));
         Ok(UsageSnapshot::new(primary).with_login_method("API key"))
     }
 }
@@ -464,7 +463,7 @@ fn rate_window_from_usage_block(block: Option<&UsageBlock>) -> RateWindow {
                 block.reset_description.clone(),
             )
         })
-        .unwrap_or_else(|| RateWindow::new(0.0))
+        .unwrap_or_else(|| RateWindow::informational("No Ollama primary usage reported"))
 }
 
 fn parse_first_datetime(html: &str) -> Option<DateTime<Utc>> {
@@ -837,6 +836,47 @@ mod tests {
         assert_eq!(
             ollama_session_action(true, false, true),
             OllamaSessionAction::ReimportBrowser
+        );
+    }
+}
+
+#[cfg(test)]
+mod informational_tests {
+    use super::*;
+    #[test]
+    fn model_list_is_information() {
+        for body in [
+            br#"{"models":[]}"#.as_slice(),
+            br#"{"models":[{"name":"test"}]}"#.as_slice(),
+        ] {
+            assert!(
+                OllamaProvider::parse_api_tags(body)
+                    .unwrap()
+                    .primary
+                    .is_informational
+            );
+        }
+        assert!(OllamaProvider::parse_api_tags(b"{}").is_err());
+    }
+    #[test]
+    fn weekly_only_does_not_invent_primary() {
+        let usage = OllamaProvider::new()
+            .parse_usage_html("Weekly usage 25% used")
+            .unwrap();
+        assert!(usage.primary.is_informational);
+        assert_eq!(usage.secondary.unwrap().used_percent, 25.0);
+    }
+    #[test]
+    fn real_zero_dollar_quota_stays_available() {
+        let usage = OllamaProvider::new()
+            .parse_usage_html("Session usage $0 of $100 used")
+            .unwrap();
+        assert!(!usage.primary.is_informational);
+        assert_eq!(usage.primary.used_percent, 0.0);
+        assert!(
+            OllamaProvider::new()
+                .parse_usage_html("<html></html>")
+                .is_err()
         );
     }
 }
