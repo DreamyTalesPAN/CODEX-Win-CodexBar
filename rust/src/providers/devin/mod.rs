@@ -147,7 +147,8 @@ fn normalized_org(raw: &str) -> String {
 
 fn snapshot_from_quota(value: &Value, org: &str) -> Result<UsageSnapshot, ProviderError> {
     let daily = percent(value, &["daily_percentage", "dailyPercentage"])
-        .or_else(|| percent(value, &["used_percent", "usedPercent"]));
+        .or_else(|| percent(value, &["used_percent", "usedPercent"]))
+        .or_else(|| generic_percent(value));
     let weekly = percent(value, &["weekly_percentage", "weeklyPercentage"]);
     if daily.is_none() && weekly.is_none() && extra_usage_balance(value).is_none() {
         return Err(ProviderError::Parse(
@@ -178,6 +179,10 @@ fn percent(value: &Value, keys: &[&str]) -> Option<f64> {
             return Some(if v < 1.0 { v * 100.0 } else { v });
         }
     }
+    None
+}
+
+fn generic_percent(value: &Value) -> Option<f64> {
     let used = ["used", "usage", "used_count", "usedCount", "consumed"]
         .iter()
         .find_map(|k| value.get(*k).and_then(Value::as_f64));
@@ -331,6 +336,22 @@ mod p1_02_balance_without_quota_survives_tests {
             assert!(result.usage.primary.is_informational);
             assert!(result.usage.secondary.is_none());
             assert_eq!(result.cost.unwrap().used, amount);
+        }
+    }
+}
+
+#[cfg(test)]
+mod p1_12_generic_counter_has_no_weekly_duplicate_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_12_generic_counter_has_no_weekly_duplicate() {
+        for used in [0, 25] {
+            let snapshot =
+                snapshot_from_quota(&serde_json::json!({"used":used,"limit":100}), "org/demo")
+                    .unwrap();
+            assert_eq!(snapshot.primary.used_percent, f64::from(used));
+            assert!(!snapshot.primary.is_informational);
+            assert!(snapshot.secondary.is_none());
         }
     }
 }
