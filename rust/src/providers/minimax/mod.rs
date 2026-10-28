@@ -377,19 +377,16 @@ impl MiniMaxProvider {
             .get("used_amount")
             .or_else(|| json.get("total_amount"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .ok_or_else(|| ProviderError::Parse("MiniMax usage counter missing".into()))?;
 
         let credit_limit = json
             .get("total_quota")
             .or_else(|| json.get("quota"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(100.0);
+            .filter(|limit| *limit > 0.0)
+            .ok_or_else(|| ProviderError::Parse("MiniMax quota total missing".into()))?;
 
-        let used_percent = if credit_limit > 0.0 {
-            (used_credits / credit_limit) * 100.0
-        } else {
-            0.0
-        };
+        let used_percent = (used_credits / credit_limit) * 100.0;
 
         let plan = json
             .get("plan_name")
@@ -708,6 +705,12 @@ impl MiniMaxProvider {
         attach_billing_summary(ProviderFetchResult::new(usage, source_label), summary)
     }
 
+    fn configured_usage() -> Result<UsageSnapshot, ProviderError> {
+        Err(ProviderError::Parse(
+            "MiniMax is configured but has no usage data".into(),
+        ))
+    }
+
     /// Probe for MiniMax installation (credentials check)
     async fn probe_cli(&self) -> Result<UsageSnapshot, ProviderError> {
         // Check if API key is configured
@@ -717,9 +720,7 @@ impl MiniMaxProvider {
             .unwrap_or(false);
 
         if has_env_vars || has_config {
-            let usage =
-                UsageSnapshot::new(RateWindow::new(0.0)).with_login_method("MiniMax (configured)");
-            Ok(usage)
+            Self::configured_usage()
         } else {
             Err(ProviderError::NotInstalled(
                 "MiniMax API not configured. Set MINIMAX_API_KEY and MINIMAX_GROUP_ID environment variables".to_string()
@@ -1305,5 +1306,39 @@ mod tests {
         assert_eq!(summary.top_methods[0].tokens, 3000);
         assert_eq!(summary.top_methods[1].name, "chat");
         assert_eq!(summary.top_methods[1].tokens, 1000);
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn configuration_is_not_usage() {
+        assert!(MiniMaxProvider::configured_usage().is_err());
+    }
+
+    #[test]
+    fn missing_usage_is_an_error() {
+        for value in [
+            json!({}),
+            json!({"total_quota":100}),
+            json!({"used_amount":0}),
+            json!({"used_amount":0,"total_quota":0}),
+        ] {
+            assert!(
+                MiniMaxProvider::new().parse_usage_response(&value).is_err(),
+                "{value}"
+            );
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = MiniMaxProvider::new()
+            .parse_usage_response(&json!({"used_amount":0,"total_quota":100}))
+            .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }
