@@ -473,7 +473,7 @@ impl ClaudeWebApiFetcher {
         headers
     }
 
-    fn resolve_session_key_from_env() -> Option<String> {
+    pub(super) fn resolve_session_key_from_env() -> Option<String> {
         for env_name in ["CLAUDE_AI_SESSION_KEY", "CLAUDE_WEB_SESSION_KEY"] {
             let Ok(value) = std::env::var(env_name) else {
                 continue;
@@ -958,6 +958,48 @@ mod tests {
             std::env::remove_var("CLAUDE_AI_SESSION_KEY");
             std::env::remove_var("CLAUDE_WEB_SESSION_KEY");
         }
+    }
+
+    // A session key in the environment is the sign-in of VibeTV's own Claude
+    // window (#273). Auto must read claude.ai with it and nothing else, so a
+    // signed-in Claude Code (a second account) cannot answer instead.
+    #[test]
+    fn auto_with_a_window_session_returns_only_the_web_error() {
+        use crate::core::{FetchContext, Provider};
+
+        let _guard = env_lock().lock().expect("env lock");
+        // SAFETY: env_lock() held for this whole test; restored before release.
+        unsafe {
+            std::env::remove_var("CLAUDE_WEB_SESSION_KEY");
+            std::env::set_var("CLAUDE_AI_SESSION_KEY", "sk-ant-window-session");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(crate::providers::ClaudeProvider::new().fetch_usage(
+            &FetchContext {
+                web_timeout: 5,
+                ..FetchContext::default()
+            },
+        ));
+
+        // SAFETY: same env_lock()-guarded mutation.
+        unsafe {
+            std::env::remove_var("CLAUDE_AI_SESSION_KEY");
+        }
+
+        // The fake key never works, so claude.ai (or the network) refuses it.
+        let message = result
+            .expect_err("a fake session key cannot read usage")
+            .to_string();
+        assert!(
+            !message.contains("all configured sources")
+                && !message.contains("OAuth:")
+                && !message.contains("CLI:"),
+            "{message}"
+        );
     }
 
     #[test]

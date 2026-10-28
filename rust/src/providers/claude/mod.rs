@@ -968,6 +968,14 @@ impl ClaudeProvider {
             return Ok(result);
         }
 
+        // A session key in the environment is the sign-in of VibeTV's own
+        // Claude window (#273). It names the account the customer chose, so a
+        // signed-in Claude Code (another account) must not answer instead, and
+        // an expired window sign-in stays an error rather than falling back.
+        if ClaudeWebApiFetcher::resolve_session_key_from_env().is_some() {
+            return self.fetch_via_web(ctx).await;
+        }
+
         // Upstream 0.50.1 #2516: track whether OAuth failed with a revocation.
         let oauth_result = self.fetch_via_oauth(ctx).await;
         let oauth_revoked = oauth_result
