@@ -332,7 +332,11 @@ impl KimiK2Provider {
 
         // Create primary rate window (credits used)
         let quota = used_credits.zip(total_credits);
-        if available_balance.is_none() && quota.is_none() {
+        if available_balance.is_none()
+            && quota.is_none()
+            && voucher_balance.is_none()
+            && cash_balance.is_none()
+        {
             return Err(ProviderError::Parse(
                 "Moonshot response contains no balance or usable quota".to_string(),
             ));
@@ -693,6 +697,25 @@ mod section_b_tests {
                 .iter()
                 .all(|row| row.window.is_informational)
         );
+    }
+
+    #[test]
+    fn cash_or_voucher_without_main_balance_keep_their_amounts() {
+        for body in [
+            json!({"code":0,"status":true,"data":{"cash_balance":12.5,"voucher_balance":3.25}}),
+            json!({"data":{"cash_balance":0}}),
+            json!({"data":{"voucher_balance":3.25}}),
+        ] {
+            let snapshot = KimiK2Provider::new()
+                .parse_usage_response(&body, MoonshotRegion::International)
+                .unwrap();
+            assert!(snapshot.primary.is_informational);
+            assert_eq!(
+                snapshot.primary.reset_description.as_deref(),
+                Some("Balance unavailable")
+            );
+            assert!(!snapshot.extra_rate_windows.is_empty());
+        }
     }
 
     #[test]

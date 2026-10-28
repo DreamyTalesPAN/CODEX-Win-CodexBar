@@ -137,12 +137,9 @@ impl DoubaoProvider {
             Ok(confirmation) if confirmation.status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
                 initial.snapshot
             }
-            Ok(confirmation) if confirmation.has_ambiguous_zero_remaining() => snapshot_from_parts(
-                confirmation.remaining,
-                confirmation.limit,
-                confirmation.resets_at,
-                false,
-            ),
+            Ok(confirmation) if confirmation.has_ambiguous_zero_remaining() => {
+                confirmation.without_request_quota()
+            }
             Ok(confirmation) => confirmation.snapshot,
             Err(error) => {
                 tracing::warn!(
@@ -193,9 +190,18 @@ struct DoubaoProbeResult {
     limit: Option<i64>,
     resets_at: Option<DateTime<Utc>>,
     request_limits_reliable: bool,
+    tokens: Option<u64>,
 }
 
 impl DoubaoProbeResult {
+    /// The request quota is ambiguous: keep only what the probe observed.
+    fn without_request_quota(&self) -> Result<UsageSnapshot, ProviderError> {
+        match self.tokens {
+            Some(tokens) => Ok(UsageSnapshot::new(tokens_information(tokens))),
+            None => snapshot_from_parts(self.remaining, self.limit, self.resets_at, false),
+        }
+    }
+
     fn has_ambiguous_zero_remaining(&self) -> bool {
         self.status == reqwest::StatusCode::OK
             && self.request_limits_reliable
@@ -219,21 +225,18 @@ fn probe_result_from_response(
     };
 
     let mut snapshot = snapshot_from_parts(remaining, limit, resets_at, request_limits_reliable);
-    if status.is_success()
-        && let Some(tokens) = body
-            .pointer("/usage/total_tokens")
-            .and_then(serde_json::Value::as_u64)
-    {
-        let information = RateWindow::informational(format!(
-            "{tokens} tokens observed in probe; request quota unavailable"
-        ));
+    let tokens = body
+        .pointer("/usage/total_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|_| status.is_success());
+    if let Some(tokens) = tokens {
         snapshot = Ok(match snapshot {
             Ok(snapshot) => snapshot.with_extra_rate_window(
                 "probe",
                 "Probe",
                 RateWindow::informational(format!("{tokens} tokens observed in probe")),
             ),
-            Err(_) => UsageSnapshot::new(information),
+            Err(_) => UsageSnapshot::new(tokens_information(tokens)),
         });
     }
 
@@ -244,7 +247,14 @@ fn probe_result_from_response(
         limit,
         resets_at,
         request_limits_reliable,
+        tokens,
     }
+}
+
+fn tokens_information(tokens: u64) -> RateWindow {
+    RateWindow::informational(format!(
+        "{tokens} tokens observed in probe; request quota unavailable"
+    ))
 }
 
 fn snapshot_from_parts(
@@ -1230,5 +1240,38 @@ mod p1_03_probe_tokens_are_information_tests {
         assert!(snapshot.primary.resets_at.is_none());
         assert!(snapshot.primary.window_minutes.is_none());
         assert!(!result.request_limits_reliable);
+    }
+
+    #[test]
+    fn review16_p2_ambiguous_zero_remaining_keeps_observed_tokens() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        let result = probe_result_from_response(
+            reqwest::StatusCode::OK,
+            &headers,
+            &serde_json::json!({"usage":{"total_tokens":7}}),
+        );
+        assert!(result.has_ambiguous_zero_remaining());
+        let snapshot = result.without_request_quota().unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert!(
+            snapshot
+                .primary
+                .reset_description
+                .unwrap()
+                .contains("7 tokens")
+        );
+        assert!(snapshot.extra_rate_windows.is_empty());
+    }
+
+    #[test]
+    fn review16_p2_ambiguous_zero_remaining_without_tokens_stays_error() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        let result =
+            probe_result_from_response(reqwest::StatusCode::OK, &headers, &serde_json::json!({}));
+        assert!(result.without_request_quota().is_err());
     }
 }
