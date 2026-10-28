@@ -287,33 +287,19 @@ impl WarpProvider {
     }
 
     fn primary_window(limit_info: &RequestLimitInfo) -> Option<RateWindow> {
-        let is_unlimited = limit_info.is_unlimited.unwrap_or(false);
+        if limit_info.is_unlimited == Some(true) {
+            return Some(RateWindow::informational("Unlimited"));
+        }
         let request_limit = limit_info.request_limit.filter(|limit| *limit > 0)?;
         let requests_used = limit_info.requests_used?;
-        let used_percent = Self::primary_used_percent(is_unlimited, requests_used, request_limit);
-        let reset_description = if is_unlimited {
-            "Unlimited".to_string()
-        } else {
-            format!("{requests_used}/{request_limit} credits")
-        };
-
-        let resets_at = (!is_unlimited)
-            .then(|| Self::parse_timestamp(limit_info.next_refresh_time.as_deref()))
-            .flatten();
+        let used_percent =
+            ((requests_used as f64) / (request_limit as f64) * 100.0).clamp(0.0, 100.0);
         Some(RateWindow::with_details(
             used_percent,
             None,
-            resets_at,
-            Some(reset_description),
+            Self::parse_timestamp(limit_info.next_refresh_time.as_deref()),
+            Some(format!("{requests_used}/{request_limit} credits")),
         ))
-    }
-
-    fn primary_used_percent(is_unlimited: bool, requests_used: i64, request_limit: i64) -> f64 {
-        if is_unlimited || request_limit <= 0 {
-            return 0.0;
-        }
-
-        ((requests_used as f64) / (request_limit as f64) * 100.0).clamp(0.0, 100.0)
     }
 
     fn all_bonus_grants<'a>(
@@ -452,15 +438,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn primary_usage_is_zero_for_unlimited_accounts() {
-        assert_eq!(WarpProvider::primary_used_percent(true, 75, 100), 0.0);
-    }
-
-    #[test]
     fn primary_usage_clamps_to_percent_range() {
-        assert_eq!(WarpProvider::primary_used_percent(false, 25, 100), 25.0);
-        assert_eq!(WarpProvider::primary_used_percent(false, 150, 100), 100.0);
-        assert_eq!(WarpProvider::primary_used_percent(false, 25, 0), 0.0);
+        for (used, expected) in [(25, 25.0), (150, 100.0), (-25, 0.0)] {
+            let window = WarpProvider::primary_window(&RequestLimitInfo {
+                is_unlimited: Some(false),
+                next_refresh_time: None,
+                request_limit: Some(100),
+                requests_used: Some(used),
+            })
+            .unwrap();
+            assert_eq!(window.used_percent, expected);
+        }
     }
 
     #[test]
@@ -546,6 +534,42 @@ mod cx289a_parent_tests {
     fn parse(value: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
         WarpProvider::build_usage_snapshot(serde_json::from_value(value).unwrap())
     }
+    #[test]
+    fn review16_unlimited_with_counters_is_information() {
+        let snapshot = parse(json!({"requestLimitInfo":{
+            "isUnlimited":true,"requestLimit":100,"requestsUsedSinceLastRefresh":25
+        }}))
+        .unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("Unlimited")
+        );
+        assert_eq!(snapshot.primary.resets_at, None);
+    }
+
+    #[test]
+    fn review16_unlimited_without_counters_keeps_bonus_quota() {
+        let snapshot = parse(json!({"requestLimitInfo":{"isUnlimited":true},
+            "bonusGrants":[{"requestCreditsGranted":100,"requestCreditsRemaining":75}]
+        }))
+        .unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("Unlimited")
+        );
+        let bonus = snapshot.secondary.unwrap();
+        assert!(!bonus.is_informational);
+        assert_eq!(bonus.used_percent, 25.0);
+        assert!(
+            parse(json!({"requestLimitInfo":{"isUnlimited":true}}))
+                .unwrap()
+                .primary
+                .is_informational
+        );
+    }
+
     #[test]
     fn missing_usage_is_an_error() {
         for value in [
