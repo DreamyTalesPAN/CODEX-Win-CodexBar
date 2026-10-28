@@ -75,9 +75,9 @@ impl DoubaoProvider {
         for model in PROBE_MODELS {
             match self.probe(api_key, model).await {
                 Ok(result) => {
-                    return Ok(self
+                    return self
                         .confirm_ambiguous_zero_remaining(api_key, model, result)
-                        .await);
+                        .await;
                 }
                 Err(error @ ProviderError::AuthRequired) => return Err(error),
                 Err(error) => {
@@ -120,7 +120,7 @@ impl DoubaoProvider {
             )));
         }
 
-        Ok(coding_plan_snapshot(decode_coding_plan_usage(&bytes)?))
+        coding_plan_snapshot(decode_coding_plan_usage(&bytes)?)
     }
 
     async fn confirm_ambiguous_zero_remaining(
@@ -128,7 +128,7 @@ impl DoubaoProvider {
         api_key: &str,
         model: &str,
         initial: DoubaoProbeResult,
-    ) -> UsageSnapshot {
+    ) -> Result<UsageSnapshot, ProviderError> {
         if !initial.has_ambiguous_zero_remaining() {
             return initial.snapshot;
         }
@@ -141,7 +141,6 @@ impl DoubaoProvider {
                 confirmation.remaining,
                 confirmation.limit,
                 confirmation.resets_at,
-                confirmation.total_tokens,
                 false,
             ),
             Ok(confirmation) => confirmation.snapshot,
@@ -188,12 +187,11 @@ impl DoubaoProvider {
 
 #[derive(Debug)]
 struct DoubaoProbeResult {
-    snapshot: UsageSnapshot,
+    snapshot: Result<UsageSnapshot, ProviderError>,
     status: reqwest::StatusCode,
     remaining: Option<i64>,
     limit: Option<i64>,
     resets_at: Option<DateTime<Utc>>,
-    total_tokens: Option<i64>,
     request_limits_reliable: bool,
 }
 
@@ -209,28 +207,18 @@ impl DoubaoProbeResult {
 fn probe_result_from_response(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
-    body: &serde_json::Value,
+    _body: &serde_json::Value,
 ) -> DoubaoProbeResult {
     let remaining = int_header(headers, "x-ratelimit-remaining-requests");
     let limit = int_header(headers, "x-ratelimit-limit-requests");
     let resets_at = string_header(headers, "x-ratelimit-reset-requests").and_then(parse_reset_time);
-    let total_tokens = body
-        .get("usage")
-        .and_then(|usage| usage.get("total_tokens"))
-        .and_then(|value| value.as_i64());
     let request_limits_reliable = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         limit.is_some()
     } else {
         limit.is_some() && remaining.is_some()
     };
 
-    let snapshot = snapshot_from_parts(
-        remaining,
-        limit,
-        resets_at,
-        total_tokens,
-        request_limits_reliable,
-    );
+    let snapshot = snapshot_from_parts(remaining, limit, resets_at, request_limits_reliable);
 
     DoubaoProbeResult {
         snapshot,
@@ -238,7 +226,6 @@ fn probe_result_from_response(
         remaining,
         limit,
         resets_at,
-        total_tokens,
         request_limits_reliable,
     }
 }
@@ -247,38 +234,25 @@ fn snapshot_from_parts(
     remaining: Option<i64>,
     limit: Option<i64>,
     resets_at: Option<DateTime<Utc>>,
-    total_tokens: Option<i64>,
     request_limits_reliable: bool,
-) -> UsageSnapshot {
-    let effective_remaining = remaining.unwrap_or(0);
-
-    let (used_percent, detail) = if let (Some(remaining), Some(limit)) = (remaining, limit) {
-        if request_limits_reliable && limit > 0 {
-            let used = (limit - remaining).max(0);
-            let percent = used as f64 / limit as f64 * 100.0;
-            (percent, format!("{used}/{limit} requests"))
-        } else {
-            (0.0, "Active - check dashboard for details".to_string())
-        }
-    } else if let Some(limit) = limit.filter(|limit| request_limits_reliable && *limit > 0) {
-        let used = (limit - effective_remaining).max(0);
-        let percent = if limit > 0 {
-            used as f64 / limit as f64 * 100.0
-        } else {
-            0.0
-        };
-        (percent, format!("{used}/{limit} requests"))
-    } else if let Some(total_tokens) = total_tokens {
-        (0.0, format!("Active - {total_tokens} tokens observed"))
-    } else {
-        (0.0, "Active - check dashboard for details".to_string())
+) -> Result<UsageSnapshot, ProviderError> {
+    let (Some(remaining), Some(limit)) = (remaining, limit.filter(|limit| *limit > 0)) else {
+        return Err(ProviderError::Parse(
+            "Doubao response contains no usable request quota".into(),
+        ));
     };
-
-    let mut window = RateWindow::with_details(used_percent, None, resets_at, Some(detail));
-    if window.used_percent.is_nan() {
-        window.used_percent = 0.0;
+    if !request_limits_reliable {
+        return Err(ProviderError::Parse(
+            "Doubao request quota is not reliable".into(),
+        ));
     }
-    UsageSnapshot::new(window)
+    let used = (limit - remaining).max(0);
+    Ok(UsageSnapshot::new(RateWindow::with_details(
+        used as f64 / limit as f64 * 100.0,
+        None,
+        resets_at,
+        Some(format!("{used}/{limit} requests")),
+    )))
 }
 
 fn int_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
@@ -422,13 +396,13 @@ fn decode_coding_plan_usage(bytes: &[u8]) -> Result<CodingPlanResult, ProviderEr
     Ok(response.result)
 }
 
-fn coding_plan_snapshot(usage: CodingPlanResult) -> UsageSnapshot {
+fn coding_plan_snapshot(usage: CodingPlanResult) -> Result<UsageSnapshot, ProviderError> {
     let primary = coding_plan_window(
         &usage,
         &["session", "5-hour", "five_hour", "5h"],
         Some(5 * 60),
     )
-    .unwrap_or_else(|| RateWindow::new(0.0));
+    .unwrap_or_else(|| RateWindow::informational("Session usage unavailable"));
     let mut snapshot = UsageSnapshot::new(primary);
     if let Some(weekly) = coding_plan_window(&usage, &["weekly", "week"], Some(7 * 24 * 60)) {
         snapshot = snapshot.with_secondary(weekly);
@@ -481,13 +455,22 @@ fn coding_plan_snapshot(usage: CodingPlanResult) -> UsageSnapshot {
             ));
         }
     }
+    if snapshot.primary.is_informational
+        && snapshot.secondary.is_none()
+        && snapshot.tertiary.is_none()
+        && snapshot.extra_rate_windows.is_empty()
+    {
+        return Err(ProviderError::Parse(
+            "Doubao Coding Plan contains no usable quota".into(),
+        ));
+    }
     if let Some(status) = usage.status.filter(|s| !s.trim().is_empty()) {
         snapshot = snapshot.with_login_method(status);
     }
     if let Some(update) = usage.update_timestamp.and_then(datetime_from_epoch) {
         snapshot.updated_at = update;
     }
-    snapshot
+    Ok(snapshot)
 }
 
 fn coding_plan_window(
@@ -745,7 +728,7 @@ fn decode_arkcli_usage(bytes: &[u8]) -> Result<CodingPlanResult, ProviderError> 
 fn fetch_arkcli_usage() -> Result<UsageSnapshot, ProviderError> {
     let stdout = run_arkcli_usage_plan()?;
     let usage = decode_arkcli_usage(&stdout)?;
-    Ok(coding_plan_snapshot(usage))
+    coding_plan_snapshot(usage)
 }
 
 fn datetime_from_epoch(timestamp: f64) -> Option<DateTime<Utc>> {
@@ -989,13 +972,14 @@ mod tests {
             "x-ratelimit-limit-requests",
             HeaderValue::from_static("100"),
         );
-        let snapshot =
-            probe_result_from_response(reqwest::StatusCode::OK, &headers, &json!({})).snapshot;
+        let snapshot = probe_result_from_response(reqwest::StatusCode::OK, &headers, &json!({}))
+            .snapshot
+            .unwrap();
         assert_eq!(snapshot.primary.used_percent, 75.0);
     }
 
     #[test]
-    fn doubao_repeated_successful_zero_remaining_falls_back_to_active() {
+    fn doubao_repeated_successful_zero_remaining_is_unavailable() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-ratelimit-remaining-requests",
@@ -1009,22 +993,12 @@ mod tests {
         let result = probe_result_from_response(reqwest::StatusCode::OK, &headers, &json!({}));
         assert!(result.has_ambiguous_zero_remaining());
 
-        let snapshot = snapshot_from_parts(
-            result.remaining,
-            result.limit,
-            result.resets_at,
-            result.total_tokens,
-            false,
-        );
-        assert_eq!(snapshot.primary.used_percent, 0.0);
-        assert_eq!(
-            snapshot.primary.reset_description.as_deref(),
-            Some("Active - check dashboard for details")
-        );
+        let snapshot = snapshot_from_parts(result.remaining, result.limit, result.resets_at, false);
+        assert!(snapshot.is_err());
     }
 
     #[test]
-    fn doubao_rate_limit_with_limit_header_reports_exhausted() {
+    fn doubao_rate_limit_without_remaining_is_unavailable() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-ratelimit-limit-requests",
@@ -1037,15 +1011,11 @@ mod tests {
         )
         .snapshot;
 
-        assert_eq!(snapshot.primary.used_percent, 100.0);
-        assert_eq!(
-            snapshot.primary.reset_description.as_deref(),
-            Some("1000/1000 requests")
-        );
+        assert!(snapshot.is_err());
     }
 
     #[test]
-    fn doubao_bare_rate_limit_uses_active_fallback() {
+    fn doubao_bare_rate_limit_is_unavailable() {
         let snapshot = probe_result_from_response(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             &HeaderMap::new(),
@@ -1053,11 +1023,7 @@ mod tests {
         )
         .snapshot;
 
-        assert_eq!(snapshot.primary.used_percent, 0.0);
-        assert_eq!(
-            snapshot.primary.reset_description.as_deref(),
-            Some("Active - check dashboard for details")
-        );
+        assert!(snapshot.is_err());
     }
 
     #[test]
@@ -1073,7 +1039,7 @@ mod tests {
                 ]
             }
         }"#;
-        let snapshot = coding_plan_snapshot(decode_coding_plan_usage(body).unwrap());
+        let snapshot = coding_plan_snapshot(decode_coding_plan_usage(body).unwrap()).unwrap();
         assert_eq!(snapshot.primary.used_percent, 12.5);
         assert_eq!(snapshot.secondary.unwrap().used_percent, 50.0);
         let monthly = snapshot.tertiary.expect("monthly");
@@ -1145,7 +1111,7 @@ mod tests {
           ]
         }"#;
         let usage = decode_arkcli_usage(raw).expect("arkcli json");
-        let snap = coding_plan_snapshot(usage);
+        let snap = coding_plan_snapshot(usage).unwrap();
         assert!((snap.primary.used_percent - 12.5).abs() < 0.01);
         assert!((snap.secondary.as_ref().unwrap().used_percent - 40.0).abs() < 0.01);
         assert!(
@@ -1184,5 +1150,43 @@ mod tests {
             )),
             crate::core::ProviderStateKind::NeedsAuthentication
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    fn parts(remaining: Option<i64>, limit: Option<i64>) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_parts(remaining, limit, None, true)
+    }
+    fn coding(body: &[u8]) -> Result<UsageSnapshot, ProviderError> {
+        coding_plan_snapshot(decode_coding_plan_usage(body)?)
+    }
+    #[test]
+    fn cx289a_missing_request_fields_are_error() {
+        for (remaining, limit) in [(None, None), (None, Some(100)), (Some(100), None)] {
+            assert!(parts(remaining, limit).is_err());
+        }
+    }
+    #[test]
+    fn cx289a_empty_coding_plan_is_error() {
+        assert!(coding(br#"{"Result":{}}"#).is_err());
+    }
+    #[test]
+    fn cx289a_weekly_only_keeps_unknown_primary() {
+        let snap =
+            coding(br#"{"Result":{"QuotaUsage":[{"Level":"weekly","Percent":0}]}}"#).unwrap();
+        assert!(snap.primary.is_informational);
+        assert_eq!(snap.secondary.unwrap().used_percent, 0.0);
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        let snap = parts(Some(100), Some(100)).unwrap();
+        assert!(!snap.primary.is_informational);
+        assert_eq!(snap.primary.used_percent, 0.0);
+        let snap =
+            coding(br#"{"Result":{"QuotaUsage":[{"Level":"session","Percent":0}]}}"#).unwrap();
+        assert!(!snap.primary.is_informational);
+        assert_eq!(snap.primary.used_percent, 0.0);
     }
 }
