@@ -408,22 +408,12 @@ pub(super) fn to_usage_snapshot(
                 .or_else(|| rows.first())
                 .ok_or_else(|| ProviderError::Parse("Missing coding plan data.".into()))?;
 
-            let primary = RateWindow::with_details(
-                primary_row.percent,
-                primary_row.window_minutes,
-                primary_row.resets_at,
-                primary_row.reset_description.clone(),
-            );
+            let primary = primary_row.to_rate_window();
             let mut usage = UsageSnapshot::new(primary);
 
             // Secondary = first qualifying weekly row
             if let Some(weekly) = rows.iter().find(|r| r.is_weekly) {
-                usage = usage.with_secondary(RateWindow::with_details(
-                    weekly.percent,
-                    weekly.window_minutes,
-                    weekly.resets_at,
-                    weekly.reset_description.clone(),
-                ));
+                usage = usage.with_secondary(weekly.to_rate_window());
             }
 
             // Every row as an extra window
@@ -434,16 +424,7 @@ pub(super) fn to_usage_snapshot(
                     row.service_type.clone()
                 };
                 let title = format!("{} · {}", row.service_type, row.window_type);
-                usage = usage.with_extra_rate_window(
-                    id,
-                    title,
-                    RateWindow::with_details(
-                        row.percent,
-                        row.window_minutes,
-                        row.resets_at,
-                        row.reset_description.clone(),
-                    ),
-                );
+                usage = usage.with_extra_rate_window(id, title, row.to_rate_window());
             }
 
             if let Some(pn) = plan_name {
@@ -642,5 +623,33 @@ mod p1_13_missing_remaining_never_becomes_exhausted_tests {
         let snapshot = to_usage_snapshot(&parsed, now).unwrap();
         assert_eq!(snapshot.primary.used_percent, 25.0);
         assert_eq!(snapshot.extra_rate_windows.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod p1_14_unlimited_is_information_in_every_slot_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_14_unlimited_is_information_in_every_slot() {
+        let now = Utc::now();
+        let value = serde_json::json!({"model_remains":[{"model_name":"General","current_weekly_status":3,"current_weekly_remaining_percent":100}]});
+        let parsed = parse_coding_plan_value(&value, now).unwrap();
+        let snapshot = to_usage_snapshot(&parsed, now).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert!(snapshot.secondary.as_ref().unwrap().is_informational);
+        assert!(!snapshot.extra_rate_windows.is_empty());
+        for window in std::iter::once(&snapshot.primary)
+            .chain(snapshot.secondary.iter())
+            .chain(
+                snapshot
+                    .extra_rate_windows
+                    .iter()
+                    .map(|extra| &extra.window),
+            )
+        {
+            assert!(window.is_informational);
+            assert!(window.resets_at.is_none());
+            assert!(window.window_minutes.is_none());
+        }
     }
 }

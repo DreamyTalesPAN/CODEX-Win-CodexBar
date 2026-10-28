@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 use regex_lite::Regex;
 use serde_json::Value;
 
-use crate::core::ProviderError;
+use crate::core::{ProviderError, RateWindow};
 
 use super::{scalar_string, value_f64, value_i64};
 
@@ -56,6 +56,21 @@ pub(super) struct RemainsRow {
     pub reset_description: Option<String>,
     pub is_unlimited: bool,
     pub is_weekly: bool,
+}
+
+impl RemainsRow {
+    pub(super) fn to_rate_window(&self) -> RateWindow {
+        if self.is_unlimited {
+            RateWindow::informational("Unlimited")
+        } else {
+            RateWindow::with_details(
+                self.percent,
+                self.window_minutes,
+                self.resets_at,
+                self.reset_description.clone(),
+            )
+        }
+    }
 }
 
 // ponytail: skipped from upstream — optional `Authorization: Bearer` on cookie
