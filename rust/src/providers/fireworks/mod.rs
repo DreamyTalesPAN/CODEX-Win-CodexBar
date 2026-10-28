@@ -160,8 +160,11 @@ impl FireworksSummary {
             .last_30_days_spend
             .zip(self.currency_code.as_deref())
             .map(|(spend, _)| format_money(spend));
-        let mut primary = RateWindow::new(0.0);
-        primary.reset_description = spend_text.clone();
+        let primary = RateWindow::informational(
+            spend_text
+                .clone()
+                .unwrap_or_else(|| "Rated spend unavailable".to_string()),
+        );
         let mut snapshot = UsageSnapshot::new(primary);
         if let Some(text) = spend_text {
             snapshot = snapshot.with_login_method(text);
@@ -595,5 +598,27 @@ mod tests {
         assert_eq!(provider.metadata().status_page_url, None);
         assert!(!provider.metadata().supports_credits);
         assert!(!provider.metadata().default_enabled);
+    }
+}
+
+#[cfg(test)]
+mod section_b_tests {
+    use super::*;
+
+    #[test]
+    fn rated_spend_is_informational_and_cost_is_preserved() {
+        let summary = parse_summary_for_testing(
+            r#"{"lineItems":[{"totalCost":{"currencyCode":"USD","units":"3","nanos":500000000}}]}"#,
+        )
+        .unwrap();
+        assert!(summary.to_usage_snapshot().primary.is_informational);
+        assert_eq!(summary.to_cost_snapshot().unwrap().used, 3.5);
+    }
+
+    #[test]
+    fn missing_rated_spend_is_not_zero_quota() {
+        let summary = parse_summary_for_testing("{}").unwrap();
+        assert!(summary.to_usage_snapshot().primary.is_informational);
+        assert!(summary.to_cost_snapshot().is_none());
     }
 }
