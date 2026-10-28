@@ -58,9 +58,9 @@ struct ParsedRateLimit {
 
 #[derive(Debug, Clone, PartialEq)]
 struct ParsedSubscription {
-    daily_usage_usd: f64,
-    weekly_usage_usd: f64,
-    monthly_usage_usd: f64,
+    daily_usage_usd: Option<f64>,
+    weekly_usage_usd: Option<f64>,
+    monthly_usage_usd: Option<f64>,
     daily_limit_usd: Option<f64>,
     weekly_limit_usd: Option<f64>,
     monthly_limit_usd: Option<f64>,
@@ -198,7 +198,7 @@ impl Sub2ApiProvider {
         if !parsed.is_valid {
             return Err(ProviderError::AuthRequired);
         }
-        Ok(snapshot_from_parsed(parsed))
+        snapshot_from_parsed(parsed)
     }
 }
 
@@ -434,9 +434,9 @@ fn parse_usage_response(response: UsageResponse) -> ParsedUsage {
             })
             .collect(),
         subscription: response.subscription.map(|s| ParsedSubscription {
-            daily_usage_usd: s.daily_usage_usd.unwrap_or(0.0),
-            weekly_usage_usd: s.weekly_usage_usd.unwrap_or(0.0),
-            monthly_usage_usd: s.monthly_usage_usd.unwrap_or(0.0),
+            daily_usage_usd: s.daily_usage_usd,
+            weekly_usage_usd: s.weekly_usage_usd,
+            monthly_usage_usd: s.monthly_usage_usd,
             daily_limit_usd: s.daily_limit_usd,
             weekly_limit_usd: s.weekly_limit_usd,
             monthly_limit_usd: s.monthly_limit_usd,
@@ -472,7 +472,7 @@ fn parse_date(raw: Option<&str>) -> Option<DateTime<Utc>> {
         })
 }
 
-fn snapshot_from_parsed(parsed: ParsedUsage) -> ProviderFetchResult {
+fn snapshot_from_parsed(parsed: ParsedUsage) -> Result<ProviderFetchResult, ProviderError> {
     let kind = classify_usage_kind(&parsed);
     let mut cost: Option<CostSnapshot> = None;
 
@@ -504,6 +504,15 @@ fn snapshot_from_parsed(parsed: ParsedUsage) -> ProviderFetchResult {
             )
             .or_else(|| informational_usage_window(sub.monthly_usage_usd, "month", &parsed.unit));
 
+            if primary.is_none()
+                && secondary.is_none()
+                && tertiary.is_none()
+                && !parsed.rate_limits.iter().any(|window| window.limit > 0.0)
+            {
+                return Err(ProviderError::Parse(
+                    "Sub2API subscription contains no usage counters".into(),
+                ));
+            }
             let mut snap = UsageSnapshot::new(
                 primary.unwrap_or_else(|| RateWindow::informational("Subscription active")),
             );
@@ -524,26 +533,34 @@ fn snapshot_from_parsed(parsed: ParsedUsage) -> ProviderFetchResult {
         }
         Kind::KeyQuota => {
             let mut snap = if let Some(quota) = &parsed.quota {
-                UsageSnapshot::new(RateWindow::with_details(
-                    used_percent(quota.used, quota.limit),
-                    None,
-                    None,
-                    Some(amount_description(quota.used, quota.limit, &quota.unit)),
-                ))
+                if quota.limit <= 0.0 {
+                    UsageSnapshot::new(RateWindow::informational("Key quota total unavailable"))
+                } else {
+                    UsageSnapshot::new(RateWindow::with_details(
+                        used_percent(quota.used, quota.limit),
+                        None,
+                        None,
+                        Some(amount_description(quota.used, quota.limit, &quota.unit)),
+                    ))
+                }
             } else if let Some(first) = parsed.rate_limits.first() {
                 // Rate-limit-only payload: promote the first window to primary.
-                UsageSnapshot::new(RateWindow::with_details(
-                    used_percent(first.used, first.limit),
-                    window_minutes(&first.window),
-                    first.reset_at,
-                    Some(amount_description(first.used, first.limit, &parsed.unit)),
-                ))
+                UsageSnapshot::new(if first.limit <= 0.0 {
+                    RateWindow::informational("Rate limit total unavailable")
+                } else {
+                    RateWindow::with_details(
+                        used_percent(first.used, first.limit),
+                        window_minutes(&first.window),
+                        first.reset_at,
+                        Some(amount_description(first.used, first.limit, &parsed.unit)),
+                    )
+                })
             } else {
                 UsageSnapshot::new(RateWindow::informational("Key quota"))
             };
             let skip_first_rate_limit = parsed.quota.is_none() && !parsed.rate_limits.is_empty();
             for (idx, rate_limit) in parsed.rate_limits.iter().enumerate() {
-                if skip_first_rate_limit && idx == 0 {
+                if (skip_first_rate_limit && idx == 0) || rate_limit.limit <= 0.0 {
                     continue;
                 }
                 snap = snap.with_extra_rate_window(
@@ -596,6 +613,9 @@ fn snapshot_from_parsed(parsed: ParsedUsage) -> ProviderFetchResult {
     // Rate-limit extras for subscription/wallet kinds that also ship them.
     if kind != Kind::KeyQuota {
         for rate_limit in &parsed.rate_limits {
+            if rate_limit.limit <= 0.0 {
+                continue;
+            }
             snapshot = snapshot.with_extra_rate_window(
                 rate_limit.window.clone(),
                 rate_limit_title(&rate_limit.window),
@@ -673,7 +693,7 @@ fn snapshot_from_parsed(parsed: ParsedUsage) -> ProviderFetchResult {
     if let Some(cost) = cost {
         result = result.with_cost(cost);
     }
-    result
+    Ok(result)
 }
 
 fn classify_usage_kind(parsed: &ParsedUsage) -> Kind {
@@ -696,7 +716,8 @@ fn wallet_remaining(parsed: &ParsedUsage) -> Option<f64> {
     parsed.remaining.filter(|r| r.is_finite())
 }
 
-fn informational_usage_window(usage: f64, period: &str, unit: &str) -> Option<RateWindow> {
+fn informational_usage_window(usage: Option<f64>, period: &str, unit: &str) -> Option<RateWindow> {
+    let usage = usage?;
     if !usage.is_finite() {
         return None;
     }
@@ -715,12 +736,13 @@ enum Kind {
 }
 
 fn rate_window_from_usage(
-    usage: f64,
+    usage: Option<f64>,
     limit: Option<f64>,
     window_minutes: Option<u32>,
     unit: &str,
 ) -> Option<RateWindow> {
-    let limit = limit.filter(|l| *l > 0.0)?;
+    let usage = usage.filter(|usage| usage.is_finite())?;
+    let limit = limit.filter(|l| l.is_finite() && *l > 0.0)?;
     Some(RateWindow::with_details(
         used_percent(usage, limit),
         window_minutes,
@@ -845,7 +867,7 @@ mod tests {
         assert_eq!(parsed.rate_limits.len(), 2);
         assert_eq!(parsed.today.as_ref().unwrap().total_tokens, 1200);
 
-        let result = snapshot_from_parsed(parsed);
+        let result = snapshot_from_parsed(parsed).unwrap();
         assert!((result.usage.primary.used_percent - 25.0).abs() < f64::EPSILON);
         assert!(result.cost.is_none());
         assert!(
@@ -892,7 +914,7 @@ mod tests {
         }
         "#;
 
-        let result = snapshot_from_parsed(parse_usage_body(json).unwrap());
+        let result = snapshot_from_parsed(parse_usage_body(json).unwrap()).unwrap();
         assert!((result.usage.primary.used_percent - 20.0).abs() < f64::EPSILON);
         assert!(
             (result.usage.secondary.as_ref().unwrap().used_percent - 25.0).abs() < f64::EPSILON
@@ -927,7 +949,7 @@ mod tests {
           "balance": 12.0
         }
         "#;
-        let result = snapshot_from_parsed(parse_usage_body(json).unwrap());
+        let result = snapshot_from_parsed(parse_usage_body(json).unwrap()).unwrap();
         assert!(result.usage.primary.is_informational);
         assert!(
             result
@@ -965,7 +987,7 @@ mod tests {
         }
         "#;
 
-        let result = snapshot_from_parsed(parse_usage_body(json).unwrap());
+        let result = snapshot_from_parsed(parse_usage_body(json).unwrap()).unwrap();
         assert!((result.usage.primary.used_percent - 100.0).abs() < f64::EPSILON);
         assert!(
             (result.usage.secondary.as_ref().unwrap().used_percent - (229.20 / 700.0 * 100.0))
@@ -999,7 +1021,7 @@ mod tests {
         }
         "#;
 
-        let result = snapshot_from_parsed(parse_usage_body(json).unwrap());
+        let result = snapshot_from_parsed(parse_usage_body(json).unwrap()).unwrap();
         assert!(result.usage.primary.is_informational);
         assert_eq!(
             result.usage.primary.reset_description.as_deref(),
@@ -1069,5 +1091,41 @@ mod tests {
         assert_eq!(query.get("days").map(String::as_str), Some("30"));
         assert!(query.contains_key("timezone"));
         assert!(!query.get("timezone").unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> ProviderFetchResult {
+        snapshot_from_parsed(parse_usage_body(&value.to_string()).unwrap()).unwrap()
+    }
+    #[test]
+    fn missing_all_subscription_counters_is_an_error() {
+        let result = parse_usage_body(r#"{"subscription":{"daily_limit_usd":100}}"#)
+            .and_then(snapshot_from_parsed);
+        assert!(result.is_err());
+    }
+    #[test]
+    fn missing_subscription_usage_is_unavailable() {
+        let result = parse(
+            json!({"subscription":{"daily_limit_usd":100,"weekly_limit_usd":200,"weekly_usage_usd":25}}),
+        );
+        assert!(result.usage.primary.is_informational);
+        assert_eq!(result.usage.secondary.unwrap().used_percent, 12.5);
+        assert!(result.usage.tertiary.is_none());
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let result = parse(json!({"subscription":{"daily_limit_usd":100,"daily_usage_usd":0}}));
+        assert_eq!(result.usage.primary.used_percent, 0.0);
+        assert!(!result.usage.primary.is_informational);
+    }
+    #[test]
+    fn zero_denominator_is_not_a_quota() {
+        let result = parse(json!({"quota":{"limit":0,"used":0,"remaining":0}}));
+        assert!(result.usage.primary.is_informational);
     }
 }
