@@ -445,11 +445,7 @@ impl ZoomMateProvider {
             .and_then(|d| d.credit_status)
             .ok_or_else(|| ProviderError::Parse("Missing credit_status object.".into()))?;
 
-        Ok(snapshot_from_credit_status(
-            &credit_status,
-            account_email,
-            Utc::now(),
-        ))
+        snapshot_from_credit_status(&credit_status, account_email, Utc::now())
     }
 }
 
@@ -730,18 +726,25 @@ pub(crate) fn snapshot_from_credit_status(
     status: &CreditStatus,
     account_email: Option<&str>,
     now: DateTime<Utc>,
-) -> UsageSnapshot {
-    let budget_cap = status.budget_cap.unwrap_or(0.0);
-    let used_credit = status.used_credit.unwrap_or(0.0);
+) -> Result<UsageSnapshot, ProviderError> {
+    let (used_credit, budget_cap) = status
+        .used_credit
+        .filter(|used| used.is_finite())
+        .zip(
+            status
+                .budget_cap
+                .filter(|limit| limit.is_finite() && *limit > 0.0),
+        )
+        .ok_or_else(|| {
+            ProviderError::Parse("ZoomMate response contains no usable credit quota".into())
+        })?;
     let is_unlimited = status.is_unlimited.unwrap_or(false);
 
-    let used_percent =
-        if is_unlimited || budget_cap <= 0.0 || !budget_cap.is_finite() || !used_credit.is_finite()
-        {
-            0.0
-        } else {
-            ((used_credit / budget_cap) * 100.0).clamp(0.0, 100.0)
-        };
+    let used_percent = if is_unlimited {
+        0.0
+    } else {
+        ((used_credit / budget_cap) * 100.0).clamp(0.0, 100.0)
+    };
 
     let cycle_start = date_from_millis(status.cycle_start_date);
     let cycle_end = date_from_millis(status.cycle_end_date);
@@ -786,7 +789,7 @@ pub(crate) fn snapshot_from_credit_status(
         status.allow_overage,
         status.is_quota_available,
     );
-    snap
+    Ok(snap)
 }
 
 // Classify failover errors for pure unit tests.
@@ -823,7 +826,8 @@ mod tests {
         let envelope: CreditsStatusEnvelope =
             serde_json::from_str(sample_status_json()).expect("fixture parses");
         let status = envelope.data.unwrap().credit_status.unwrap();
-        let snap = snapshot_from_credit_status(&status, Some("user@zoom.us"), Utc::now());
+        let snap =
+            snapshot_from_credit_status(&status, Some("user@zoom.us"), Utc::now()).expect("quota");
         assert!((snap.primary.used_percent - 25.0).abs() < 0.01);
         assert_eq!(snap.primary.reset_description.as_deref(), Some("Credits"));
         assert!(snap.primary.resets_at.is_some());
@@ -834,14 +838,14 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_or_zero_cap_yields_zero_percent() {
+    fn unlimited_is_zero_but_zero_cap_is_unavailable() {
         let unlimited = CreditStatus {
             budget_cap: Some(100.0),
             used_credit: Some(50.0),
             is_unlimited: Some(true),
             ..Default::default()
         };
-        let snap = snapshot_from_credit_status(&unlimited, None, Utc::now());
+        let snap = snapshot_from_credit_status(&unlimited, None, Utc::now()).expect("quota");
         assert_eq!(snap.primary.used_percent, 0.0);
         assert!(snap.primary.resets_at.is_none());
 
@@ -851,8 +855,7 @@ mod tests {
             is_unlimited: Some(false),
             ..Default::default()
         };
-        let snap = snapshot_from_credit_status(&zero_cap, None, Utc::now());
-        assert_eq!(snap.primary.used_percent, 0.0);
+        assert!(snapshot_from_credit_status(&zero_cap, None, Utc::now()).is_err());
     }
 
     #[test]
@@ -864,7 +867,7 @@ mod tests {
             cycle_end_date: Some(1_900_000_000_000),
             ..Default::default()
         };
-        let snap = snapshot_from_credit_status(&status, None, Utc::now());
+        let snap = snapshot_from_credit_status(&status, None, Utc::now()).expect("quota");
         assert_eq!(snap.primary.used_percent, 100.0);
     }
 
@@ -1055,5 +1058,32 @@ mod tests {
             "ai.zoom.us"
         ));
         assert!(!cookie_is_sendable_to_host("", "ai.zoom.us"));
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_credit_status(&serde_json::from_value(value).unwrap(), None, Utc::now())
+    }
+    #[test]
+    fn missing_usage_is_an_error() {
+        for value in [
+            json!({}),
+            json!({"budget_cap":100}),
+            json!({"used_credit":0}),
+            json!({"used_credit":0,"budget_cap":0}),
+        ] {
+            assert!(parse(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = parse(json!({"used_credit":0,"budget_cap":100})).unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

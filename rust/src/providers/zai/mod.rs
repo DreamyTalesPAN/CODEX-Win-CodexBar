@@ -360,39 +360,26 @@ impl ZaiProvider {
         // used signal (`usage - remaining`, or `currentValue`) wins over the
         // API's own `percentage`; otherwise `percentage` is trusted, and
         // legacy `limit`/`used` responses fall back to the old math.
-        fn compute_percent(l: &ZaiLimit) -> f64 {
+        fn compute_percent(l: &ZaiLimit) -> Option<f64> {
             if let Some(usage) = l.usage.filter(|&usage| usage > 0.0) {
-                let used = if let Some(remaining) = l.remaining {
-                    let from_remaining = usage - remaining;
-                    let baseline = l.current_value.unwrap_or(from_remaining);
-                    from_remaining.max(baseline)
-                } else {
-                    l.current_value.unwrap_or(0.0)
+                let used = match (l.remaining, l.current_value) {
+                    (Some(remaining), current) => {
+                        (usage - remaining).max(current.unwrap_or(usage - remaining))
+                    }
+                    (None, Some(current)) => current,
+                    (None, None) => return l.percentage.map(|v| v.clamp(0.0, 100.0)),
                 };
-                let clamped = used.clamp(0.0, usage);
-                return (clamped / usage * 100.0).clamp(0.0, 100.0);
+                return Some((used / usage * 100.0).clamp(0.0, 100.0));
             }
             if let Some(percentage) = l.percentage {
-                return percentage.clamp(0.0, 100.0);
+                return Some(percentage.clamp(0.0, 100.0));
             }
-
-            let limit = l.limit.unwrap_or(0.0);
-            if limit <= 0.0 {
-                return if l.used.unwrap_or(0.0) > 0.0 || l.current_value.unwrap_or(0.0) > 0.0 {
-                    100.0
-                } else {
-                    0.0
-                };
-            }
-            let used = {
-                let from_remaining = l.remaining.map(|r| limit - r);
-                let from_current = l.current_value;
-                let from_used = l.used;
-                // Use max of available signals
-                let candidates = [from_remaining, from_current, from_used];
-                candidates.iter().filter_map(|&v| v).fold(0.0_f64, f64::max)
-            };
-            ((used / limit) * 100.0).clamp(0.0, 100.0)
+            let limit = l.limit.filter(|limit| *limit > 0.0)?;
+            let used = [l.remaining.map(|r| limit - r), l.current_value, l.used]
+                .into_iter()
+                .flatten()
+                .reduce(f64::max)?;
+            Some((used / limit * 100.0).clamp(0.0, 100.0))
         }
 
         // Upstream 0.48.0 `rateWindow`/`resetDescription`: only token-type
@@ -400,7 +387,7 @@ impl ZaiProvider {
         // label and no window duration; 5-hour token windows are labeled
         // "5-hour"; otherwise the explicit window label is used.
         let now = Utc::now();
-        let make_window = |l: &ZaiLimit| -> RateWindow {
+        let make_window = |l: &ZaiLimit| -> Option<RateWindow> {
             let is_tokens = matches!(
                 l.limit_type.as_deref(),
                 Some("TOKENS_LIMIT") | Some("CREDIT_LIMIT") | Some("tokens")
@@ -421,12 +408,12 @@ impl ZaiProvider {
                 });
             let resets_at =
                 resets_at.filter(|reset| is_plausible_five_hour_reset(window_mins, *reset, now));
-            RateWindow::with_details(
-                compute_percent(l),
+            Some(RateWindow::with_details(
+                compute_percent(l)?,
                 window_mins,
                 resets_at,
                 rate_window_reset_description(l, window_mins),
-            )
+            ))
         };
 
         // Upstream 0.48.0 bucket split: with 2+ token limits, the shortest
@@ -445,19 +432,25 @@ impl ZaiProvider {
             None
         };
 
-        let primary = primary_limit
-            .map(make_window)
-            .unwrap_or_else(|| RateWindow::new(0.0));
-        let mut usage = UsageSnapshot::new(primary).with_login_method(plan_name);
-        if let Some(secondary) = secondary_limit {
-            usage = usage.with_secondary(make_window(secondary));
+        let primary = primary_limit.and_then(make_window);
+        let secondary = secondary_limit.and_then(make_window);
+        let mcp = (token_limit.is_some() || session_token_limit.is_some())
+            .then(|| time_limit.and_then(make_window))
+            .flatten();
+        if primary.is_none() && secondary.is_none() && mcp.is_none() {
+            return Err(ProviderError::Parse(
+                "z.ai response contains no usable quota".into(),
+            ));
         }
-        // MCP usage is a separate named window whenever a coding-limit
-        // primary exists; with no token limits it already owns the primary.
-        if (token_limit.is_some() || session_token_limit.is_some())
-            && let Some(mcp) = time_limit
-        {
-            usage = usage.with_extra_rate_window("zai-mcp", "MCP", make_window(mcp));
+        let mut usage = UsageSnapshot::new(
+            primary.unwrap_or_else(|| RateWindow::informational("z.ai primary usage unavailable")),
+        )
+        .with_login_method(plan_name);
+        if let Some(secondary) = secondary {
+            usage = usage.with_secondary(secondary);
+        }
+        if let Some(mcp) = mcp {
+            usage = usage.with_extra_rate_window("zai-mcp", "MCP", mcp);
         }
 
         Ok(usage)
@@ -618,3 +611,36 @@ impl Provider for ZaiProvider {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
+        ZaiProvider::new().parse_quota_response(&serde_json::from_value(value).unwrap())
+    }
+    #[test]
+    fn missing_usage_is_an_error() {
+        for value in [
+            json!({}),
+            json!({"data":{"planName":"Pro","limits":[]}}),
+            json!({"limits":[{"type":"TOKENS_LIMIT","usage":100}]}),
+            json!({"limits":[{"type":"TOKENS_LIMIT","limit":100}]}),
+        ] {
+            assert!(parse(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        for limit in [
+            json!({"type":"TOKENS_LIMIT","usage":100,"currentValue":0}),
+            json!({"type":"tokens","limit":100,"used":0}),
+            json!({"type":"TOKENS_LIMIT","percentage":0}),
+        ] {
+            let snapshot = parse(json!({"limits":[limit]})).unwrap();
+            assert_eq!(snapshot.primary.used_percent, 0.0);
+            assert!(!snapshot.primary.is_informational);
+        }
+    }
+}

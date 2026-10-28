@@ -131,7 +131,7 @@ impl JetBrainsProvider {
         // </component>
 
         let quota = Self::parse_quota_values(content);
-        Ok(Self::usage_from_quota(quota))
+        Self::usage_from_quota(quota)
     }
 
     fn parse_quota_values(content: &str) -> JetBrainsQuota {
@@ -145,8 +145,11 @@ impl JetBrainsProvider {
         quota
     }
 
-    fn usage_from_quota(quota: JetBrainsQuota) -> UsageSnapshot {
-        UsageSnapshot::new(RateWindow::new(quota.used_percent())).with_login_method("JetBrains AI")
+    fn usage_from_quota(quota: JetBrainsQuota) -> Result<UsageSnapshot, ProviderError> {
+        let percent = quota.used_percent().ok_or_else(|| {
+            ProviderError::Parse("JetBrains config contains no usable credit quota".into())
+        })?;
+        Ok(UsageSnapshot::new(RateWindow::new(percent)).with_login_method("JetBrains AI"))
     }
 
     /// Extract numeric value from XML attribute
@@ -168,18 +171,10 @@ impl JetBrainsProvider {
     }
 }
 
+#[derive(Default)]
 struct JetBrainsQuota {
-    used_credits: f64,
-    credit_limit: f64,
-}
-
-impl Default for JetBrainsQuota {
-    fn default() -> Self {
-        Self {
-            used_credits: 0.0,
-            credit_limit: 1000.0,
-        }
-    }
+    used_credits: Option<f64>,
+    credit_limit: Option<f64>,
 }
 
 impl JetBrainsQuota {
@@ -187,13 +182,13 @@ impl JetBrainsQuota {
         if Self::is_used_credits_line(line)
             && let Some(value) = JetBrainsProvider::extract_xml_value(line)
         {
-            self.used_credits = value;
+            self.used_credits = Some(value);
         }
 
         if Self::is_credit_limit_line(line)
             && let Some(value) = JetBrainsProvider::extract_xml_value(line)
         {
-            self.credit_limit = value;
+            self.credit_limit = Some(value);
         }
     }
 
@@ -210,12 +205,10 @@ impl JetBrainsQuota {
             || line.contains("monthlyLimit")
     }
 
-    fn used_percent(&self) -> f64 {
-        if self.credit_limit > 0.0 {
-            (self.used_credits / self.credit_limit) * 100.0
-        } else {
-            0.0
-        }
+    fn used_percent(&self) -> Option<f64> {
+        let used = self.used_credits?;
+        let limit = self.credit_limit.filter(|limit| *limit > 0.0)?;
+        Some(used / limit * 100.0)
     }
 }
 
@@ -288,5 +281,29 @@ mod tests {
             )),
             crate::core::ProviderStateKind::LocalRuntimeOffline
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    #[test]
+    fn cx289a_missing_credit_fields_are_error() {
+        for xml in [
+            "<component />",
+            r#"<option name="creditLimit" value="100" />"#,
+            r#"<option name="usedCredits" value="0" />"#,
+        ] {
+            assert!(
+                JetBrainsProvider::new().parse_xml_config(xml).is_err(),
+                "{xml}"
+            );
+        }
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        let snap = JetBrainsProvider::new().parse_xml_config("<option name=\"usedCredits\" value=\"0\" />\n<option name=\"creditLimit\" value=\"100\" />").unwrap();
+        assert!(!snap.primary.is_informational);
+        assert_eq!(snap.primary.used_percent, 0.0);
     }
 }

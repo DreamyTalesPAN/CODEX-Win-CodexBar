@@ -97,7 +97,7 @@ impl Provider for DevinProvider {
                 let value: Value = response.json().await.map_err(|e| {
                     ProviderError::Parse(format!("Failed to parse Devin quota: {e}"))
                 })?;
-                Ok(fetch_result_from_quota(&value, &org))
+                fetch_result_from_quota(&value, &org)
             }
             SourceMode::Web | SourceMode::Cli => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
@@ -145,23 +145,31 @@ fn normalized_org(raw: &str) -> String {
     }
 }
 
-fn snapshot_from_quota(value: &Value, org: &str) -> UsageSnapshot {
+fn snapshot_from_quota(value: &Value, org: &str) -> Result<UsageSnapshot, ProviderError> {
     let daily = percent(value, &["daily_percentage", "dailyPercentage"])
-        .unwrap_or_else(|| percent(value, &["used_percent", "usedPercent"]).unwrap_or(0.0));
-    let mut snapshot =
-        UsageSnapshot::new(RateWindow::new(daily)).with_organization(org.to_string());
-    if let Some(weekly) = percent(value, &["weekly_percentage", "weeklyPercentage"]) {
+        .or_else(|| percent(value, &["used_percent", "usedPercent"]));
+    let weekly = percent(value, &["weekly_percentage", "weeklyPercentage"]);
+    if daily.is_none() && weekly.is_none() {
+        return Err(ProviderError::Parse(
+            "Devin response contains no usable quota".into(),
+        ));
+    }
+    let primary = daily
+        .map(RateWindow::new)
+        .unwrap_or_else(|| RateWindow::informational("Daily usage unavailable"));
+    let mut snapshot = UsageSnapshot::new(primary).with_organization(org.to_string());
+    if let Some(weekly) = weekly {
         snapshot = snapshot.with_secondary(RateWindow::new(weekly));
     }
-    snapshot
+    Ok(snapshot)
 }
 
-fn fetch_result_from_quota(value: &Value, org: &str) -> ProviderFetchResult {
-    let mut result = ProviderFetchResult::new(snapshot_from_quota(value, org), "api");
+fn fetch_result_from_quota(value: &Value, org: &str) -> Result<ProviderFetchResult, ProviderError> {
+    let mut result = ProviderFetchResult::new(snapshot_from_quota(value, org)?, "api");
     if let Some(balance) = extra_usage_balance(value) {
         result = result.with_cost(CostSnapshot::new(balance, "USD", "Extra usage balance"));
     }
-    result
+    Ok(result)
 }
 
 fn percent(value: &Value, keys: &[&str]) -> Option<f64> {
@@ -208,14 +216,14 @@ mod tests {
     #[test]
     fn parses_fraction_percent() {
         let snapshot =
-            snapshot_from_quota(&serde_json::json!({"daily_percentage":0.25}), "org/demo");
+            snapshot_from_quota(&serde_json::json!({"daily_percentage":0.25}), "org/demo").unwrap();
         assert_eq!(snapshot.primary.used_percent, 25.0);
     }
 
     #[test]
     fn parses_exact_one_as_one_percent() {
         let snapshot =
-            snapshot_from_quota(&serde_json::json!({"daily_percentage":1.0}), "org/demo");
+            snapshot_from_quota(&serde_json::json!({"daily_percentage":1.0}), "org/demo").unwrap();
         assert_eq!(snapshot.primary.used_percent, 1.0);
     }
 
@@ -224,7 +232,8 @@ mod tests {
         let result = fetch_result_from_quota(
             &serde_json::json!({"daily_percentage": 0.2, "overage_balance": 12.34}),
             "org/demo",
-        );
+        )
+        .unwrap();
 
         let cost = result.cost.unwrap();
         assert_eq!(cost.used, 12.34);
@@ -236,7 +245,8 @@ mod tests {
         let result = fetch_result_from_quota(
             &serde_json::json!({"daily_percentage": 0.2, "overage_balance_cents": 7087}),
             "org/demo",
-        );
+        )
+        .unwrap();
 
         assert_eq!(result.cost.unwrap().used, 70.87);
     }
@@ -276,5 +286,34 @@ mod tests {
     fn ignores_organization_detail_on_non_authorization_responses() {
         let body = br#"{"detail":"No organizations found for auth1 user"}"#;
         assert!(auth_response_error(reqwest::StatusCode::NOT_FOUND, body).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    fn build(value: Value) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_quota(&value, "org/synthetic")
+    }
+    #[test]
+    fn cx289a_missing_quota_is_error() {
+        for value in [json!({}), json!({"limit":100}), json!({"used":0})] {
+            assert!(build(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn cx289a_weekly_only_keeps_unknown_primary() {
+        let snap = build(json!({"weekly_percentage":25})).unwrap();
+        assert!(snap.primary.is_informational);
+        assert_eq!(snap.secondary.unwrap().used_percent, 25.0);
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        for value in [json!({"used":0,"limit":100}), json!({"daily_percentage":0})] {
+            let snap = build(value).unwrap();
+            assert!(!snap.primary.is_informational);
+            assert_eq!(snap.primary.used_percent, 0.0);
+        }
     }
 }

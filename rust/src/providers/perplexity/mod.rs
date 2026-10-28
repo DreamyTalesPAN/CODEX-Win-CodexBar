@@ -30,7 +30,7 @@ struct CreditsResponse {
     #[serde(default)]
     credit_grants: Vec<CreditGrant>,
     #[serde(default)]
-    total_usage_cents: f64,
+    total_usage_cents: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,7 +38,7 @@ struct CreditGrant {
     #[serde(default, rename = "type")]
     grant_type: String,
     #[serde(default)]
-    amount_cents: f64,
+    amount_cents: Option<f64>,
     #[serde(default)]
     expires_at_ts: Option<f64>,
 }
@@ -88,17 +88,20 @@ impl PerplexityProvider {
         let mut purchased_total = 0.0_f64;
 
         for grant in &resp.credit_grants {
+            let amount = grant.amount_cents.ok_or_else(|| {
+                ProviderError::Parse("Perplexity credit grant amount missing".into())
+            })?;
             match grant.grant_type.as_str() {
-                "recurring" => recurring_total += grant.amount_cents,
+                "recurring" => recurring_total += amount,
                 "promotional" | "bonus" => {
-                    bonus_total += grant.amount_cents;
+                    bonus_total += amount;
                     if let Some(ts) = grant.expires_at_ts.and_then(Self::ts_to_datetime)
                         && bonus_expiry.is_none_or(|cur| ts < cur)
                     {
                         bonus_expiry = Some(ts);
                     }
                 }
-                "purchased" => purchased_total += grant.amount_cents,
+                "purchased" => purchased_total += amount,
                 _ => {}
             }
         }
@@ -108,7 +111,15 @@ impl PerplexityProvider {
         }
 
         // Waterfall attribution: usage burns recurring first, then bonus, then purchased.
-        let mut remaining_usage = resp.total_usage_cents.max(0.0);
+        let mut remaining_usage = resp
+            .total_usage_cents
+            .ok_or_else(|| ProviderError::Parse("Perplexity usage counter missing".into()))?
+            .max(0.0);
+        if recurring_total <= 0.0 && bonus_total <= 0.0 && purchased_total <= 0.0 {
+            return Err(ProviderError::Parse(
+                "Perplexity response contains no credit quota".into(),
+            ));
+        }
         let recurring_used = remaining_usage.min(recurring_total);
         remaining_usage -= recurring_used;
         let bonus_used = remaining_usage.min(bonus_total);
@@ -125,13 +136,20 @@ impl PerplexityProvider {
 
         let renewal = resp.renewal_date_ts.and_then(Self::ts_to_datetime);
 
-        let mut primary = RateWindow::new(pct(recurring_used, recurring_total));
-        primary.resets_at = renewal;
-        primary.reset_description = Some(format!(
-            "${:.2}/${:.2}",
-            recurring_used / 100.0,
-            recurring_total / 100.0
-        ));
+        let primary = if recurring_total > 0.0 {
+            RateWindow::with_details(
+                pct(recurring_used, recurring_total),
+                None,
+                renewal,
+                Some(format!(
+                    "${:.2}/${:.2}",
+                    recurring_used / 100.0,
+                    recurring_total / 100.0
+                )),
+            )
+        } else {
+            RateWindow::informational("No recurring credit quota")
+        };
 
         let mut snapshot = UsageSnapshot::new(primary);
 
@@ -315,5 +333,41 @@ mod tests {
         .unwrap();
         let snap = PerplexityProvider::parse_response(resp).unwrap();
         assert_eq!(snap.login_method.as_deref(), Some("Max"));
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
+        PerplexityProvider::parse_response(serde_json::from_value(value).unwrap())
+    }
+    #[test]
+    fn missing_usage_is_an_error() {
+        for value in [
+            json!({}),
+            json!({"credit_grants":[{"type":"recurring","amount_cents":100}]}),
+            json!({"total_usage_cents":0}),
+            json!({"total_usage_cents":0,"credit_grants":[{"type":"recurring"}]}),
+        ] {
+            assert!(parse(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = parse(json!({"total_usage_cents":0,"credit_grants":[{"type":"recurring","amount_cents":100}]})).unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
+    }
+    #[test]
+    fn bonus_only_keeps_recurring_unavailable() {
+        let snapshot = parse(
+            json!({"total_usage_cents":0,"credit_grants":[{"type":"bonus","amount_cents":100}]}),
+        )
+        .unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(snapshot.secondary.unwrap().used_percent, 0.0);
     }
 }

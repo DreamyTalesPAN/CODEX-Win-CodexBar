@@ -128,7 +128,7 @@ impl CodebuffProvider {
         })?;
 
         let subscription = self.fetch_subscription(&base, &api_key).await;
-        Ok(Self::snapshot_from_values(&usage, subscription.as_ref()))
+        Self::snapshot_from_values(&usage, subscription.as_ref())
     }
 
     async fn fetch_subscription(&self, base: &Url, api_key: &str) -> Option<Value> {
@@ -150,41 +150,53 @@ impl CodebuffProvider {
         resp.json::<Value>().await.ok()
     }
 
-    fn snapshot_from_values(usage: &Value, subscription: Option<&Value>) -> UsageSnapshot {
+    fn snapshot_from_values(
+        usage: &Value,
+        subscription: Option<&Value>,
+    ) -> Result<UsageSnapshot, ProviderError> {
         let usage = data_payload(usage);
         let subscription = subscription.map(data_payload);
-        let used = number_at(usage, &["usage", "used"]).unwrap_or(0.0);
+        let used = number_at(usage, &["usage", "used"]);
         let remaining = number_at(usage, &["remainingBalance", "remaining"]);
-        let total = number_at(usage, &["creditsTotal", "quota", "limit"])
-            .or_else(|| remaining.map(|r| used + r));
-
-        let percent = match (total, remaining) {
-            (Some(total), _) if total > 0.0 => (used / total * 100.0).clamp(0.0, 100.0),
-            (None, Some(_)) => 100.0,
-            _ => 0.0,
-        };
-
-        let mut primary = RateWindow::new(percent);
-        if let Some(reset) =
-            string_at(usage, &["next_quota_reset", "nextQuotaReset"]).and_then(parse_datetime)
+        let total = number_at(usage, &["creditsTotal", "quota", "limit"]).or_else(|| {
+            used.zip(remaining)
+                .map(|(used, remaining)| used + remaining)
+        });
+        let used = used.or_else(|| {
+            total
+                .zip(remaining)
+                .map(|(total, remaining)| total - remaining)
+        });
+        let weekly = subscription
+            .and_then(|v| v.get("rateLimit").or_else(|| v.get("subscription")))
+            .and_then(weekly_window);
+        let primary = match used
+            .zip(total)
+            .filter(|(used, total)| used.is_finite() && total.is_finite() && *total > 0.0)
         {
-            primary.resets_at = Some(reset);
-        }
-        primary.reset_description = match (used, total, remaining) {
-            (_, Some(total), Some(remaining)) => Some(format!(
-                "{used:.0}/{total:.0} credits ({remaining:.0} remaining)"
-            )),
-            (_, Some(total), None) => Some(format!("{used:.0}/{total:.0} credits")),
-            (_, None, Some(remaining)) => Some(format!("{remaining:.0} credits remaining")),
-            _ => None,
+            Some((used, total)) => {
+                let mut window = RateWindow::new((used / total * 100.0).clamp(0.0, 100.0));
+                window.resets_at = string_at(usage, &["next_quota_reset", "nextQuotaReset"])
+                    .and_then(parse_datetime);
+                window.reset_description = Some(match remaining {
+                    Some(remaining) => {
+                        format!("{used:.0}/{total:.0} credits ({remaining:.0} remaining)")
+                    }
+                    None => format!("{used:.0}/{total:.0} credits"),
+                });
+                window
+            }
+            None if weekly.is_some() => {
+                RateWindow::informational("Codebuff credit usage unavailable")
+            }
+            None => {
+                return Err(ProviderError::Parse(
+                    "Codebuff response contains no usable quota".into(),
+                ));
+            }
         };
-
         let mut snapshot = UsageSnapshot::new(primary);
-
-        if let Some(rate_limit) =
-            subscription.and_then(|v| v.get("rateLimit").or_else(|| v.get("subscription")))
-            && let Some(weekly) = weekly_window(rate_limit)
-        {
+        if let Some(weekly) = weekly {
             snapshot = snapshot.with_secondary(weekly);
         }
 
@@ -221,7 +233,7 @@ impl CodebuffProvider {
             snapshot = snapshot.with_login_method(method_parts.join(" · "));
         }
 
-        snapshot
+        Ok(snapshot)
     }
 }
 
@@ -330,7 +342,7 @@ mod tests {
             }
         });
 
-        let snapshot = CodebuffProvider::snapshot_from_values(&usage, Some(&subscription));
+        let snapshot = CodebuffProvider::snapshot_from_values(&usage, Some(&subscription)).unwrap();
 
         assert_eq!(snapshot.primary.used_percent, 25.0);
         assert_eq!(
@@ -361,12 +373,60 @@ mod tests {
             }
         });
 
-        let snapshot = CodebuffProvider::snapshot_from_values(&usage, Some(&subscription));
+        let snapshot = CodebuffProvider::snapshot_from_values(&usage, Some(&subscription)).unwrap();
 
         assert_eq!(snapshot.primary.used_percent, 40.0);
         assert_eq!(
             snapshot.login_method.as_deref(),
             Some("Team · 60 remaining")
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cx289a_incomplete_quotas_are_rejected() {
+        for payload in [
+            json!({}),
+            json!({"creditsTotal":100}),
+            json!({"remaining":100}),
+            json!({"used":0}),
+        ] {
+            assert!(CodebuffProvider::snapshot_from_values(&payload, None).is_err());
+        }
+    }
+    #[test]
+    fn cx289a_remaining_and_total_determine_used() {
+        let snapshot = CodebuffProvider::snapshot_from_values(
+            &json!({"creditsTotal":100,"remaining":75}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 25.0);
+    }
+
+    #[test]
+    fn cx289a_weekly_only_keeps_primary_unknown() {
+        let snapshot = CodebuffProvider::snapshot_from_values(
+            &json!({"creditsTotal":100}),
+            Some(&json!({"rateLimit":{"weeklyUsed":0,"weeklyLimit":100}})),
+        )
+        .unwrap();
+        assert!(snapshot.primary.is_informational);
+        let weekly = snapshot.secondary.unwrap();
+        assert_eq!(weekly.used_percent, 0.0);
+        assert!(!weekly.is_informational);
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved() {
+        let snapshot =
+            CodebuffProvider::snapshot_from_values(&json!({"creditsTotal":100,"used":0}), None)
+                .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

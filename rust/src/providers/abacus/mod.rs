@@ -28,9 +28,7 @@ struct ApiEnvelope<T> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ComputePoints {
-    #[serde(default)]
     total_compute_points: f64,
-    #[serde(default)]
     compute_points_left: f64,
 }
 
@@ -332,5 +330,33 @@ mod tests {
             "12,345 / 50,000 credits"
         );
         assert_eq!(format_credit_detail(42.5, 100.0), "42.5 / 100 credits");
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cx289a_missing_compute_fields_are_rejected() {
+        for payload in [
+            json!({}),
+            json!({"totalComputePoints":100}),
+            json!({"computePointsLeft":100}),
+        ] {
+            let result = serde_json::from_value::<ComputePoints>(payload)
+                .map_err(|e| ProviderError::Parse(e.to_string()))
+                .and_then(|compute| AbacusProvider::build_snapshot(compute, None));
+            assert!(result.is_err());
+        }
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved() {
+        let compute =
+            serde_json::from_value(json!({"totalComputePoints":100,"computePointsLeft":100}))
+                .unwrap();
+        let snapshot = AbacusProvider::build_snapshot(compute, None).unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

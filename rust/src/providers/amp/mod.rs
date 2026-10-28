@@ -121,19 +121,16 @@ impl AmpProvider {
             .get("completionsUsed")
             .or_else(|| json.get("used"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .ok_or_else(|| ProviderError::Parse("Amp usage counter missing".into()))?;
 
         let limit = json
             .get("completionsLimit")
             .or_else(|| json.get("limit"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(500.0);
+            .filter(|limit| *limit > 0.0)
+            .ok_or_else(|| ProviderError::Parse("Amp usage limit missing or invalid".into()))?;
 
-        let used_percent = if limit > 0.0 {
-            (used / limit) * 100.0
-        } else {
-            0.0
-        };
+        let used_percent = (used / limit) * 100.0;
 
         let plan = json
             .get("plan")
@@ -153,6 +150,12 @@ impl AmpProvider {
         Ok(usage)
     }
 
+    fn configured_usage() -> Result<UsageSnapshot, ProviderError> {
+        Err(ProviderError::Parse(
+            "Amp is configured, but usage is unavailable".into(),
+        ))
+    }
+
     /// Probe for Amp installation
     async fn probe_cli(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
         // Check ctx.api_key first
@@ -170,9 +173,7 @@ impl AmpProvider {
             .unwrap_or(false);
 
         if has_api_key || has_env || has_amp_config || has_cody_config {
-            let usage =
-                UsageSnapshot::new(RateWindow::new(0.0)).with_login_method("Amp (configured)");
-            Ok(usage)
+            Self::configured_usage()
         } else {
             Err(ProviderError::NotInstalled(
                 "Amp not configured. Set SRC_ACCESS_TOKEN environment variable or configure Amp."
@@ -641,5 +642,32 @@ mod current_subscription_tests {
             Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 0).unwrap()
         );
         assert_eq!(sub.reset_description, "renews in 1 month");
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cx289a_configuration_is_not_usage() {
+        assert!(super::AmpProvider::configured_usage().is_err());
+    }
+
+    #[test]
+    fn cx289a_missing_usage_is_rejected() {
+        let provider = AmpProvider::new();
+        for payload in [json!({}), json!({"limit":100}), json!({"used":0})] {
+            assert!(provider.parse_usage_response(&payload).is_err());
+        }
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved() {
+        let snapshot = AmpProvider::new()
+            .parse_usage_response(&json!({"used":0,"limit":100}))
+            .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

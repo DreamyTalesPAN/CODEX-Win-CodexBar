@@ -500,44 +500,44 @@ fn totals_from_api_payload(value: &Value) -> Result<CreditTotals, ProviderError>
     let mut reset: Option<DateTime<Utc>> = None;
 
     for account in accounts {
-        total += precise_or_field(account, "CapacitySizePrecise", "CapacitySize").unwrap_or(0.0);
-        used += precise_or_field(account, "CapacityUsedPrecise", "CapacityUsed").unwrap_or(0.0);
-        remaining +=
-            precise_or_field(account, "CapacityRemainPrecise", "CapacityRemain").unwrap_or(0.0);
+        let account_total = precise_or_field(account, "CapacitySizePrecise", "CapacitySize")
+            .ok_or_else(|| ProviderError::Parse("CodeBuddy package total missing".into()))?;
+        let totals = CreditTotals::normalized(
+            account_total,
+            precise_or_field(account, "CapacityUsedPrecise", "CapacityUsed"),
+            precise_or_field(account, "CapacityRemainPrecise", "CapacityRemain"),
+            None,
+        )?;
+        total += totals.total;
+        used += totals.used;
+        remaining += totals.remaining;
         if let Some(reset_at) = expire_time(account) {
             reset = Some(reset.map_or(reset_at, |prev| prev.min(reset_at)));
         }
     }
 
-    CreditTotals::normalized(total, used, remaining, reset)
+    CreditTotals::normalized(total, Some(used), Some(remaining), reset)
 }
 
 impl CreditTotals {
-    /// Reconcile partial sums: prefer summed remaining, recompute used when it
-    /// is missing, and clamp every field to non-negative.
+    /// Derive a missing counter only from a measured total and its counterpart.
     fn normalized(
-        mut total: f64,
-        mut used: f64,
-        mut remaining: f64,
+        total: f64,
+        used: Option<f64>,
+        remaining: Option<f64>,
         reset: Option<DateTime<Utc>>,
     ) -> Result<CreditTotals, ProviderError> {
-        if !(total.is_finite() && used.is_finite() && remaining.is_finite()) {
+        let used = used
+            .or_else(|| remaining.map(|remaining| total - remaining))
+            .ok_or_else(|| ProviderError::Parse("CodeBuddy usage counter missing".into()))?;
+        let remaining = remaining.unwrap_or(total - used);
+        if !(total.is_finite() && total > 0.0 && used.is_finite() && remaining.is_finite()) {
             return Err(ProviderError::Parse(
-                "CodeBuddy payload contains non-finite credit values".into(),
+                "CodeBuddy payload contains invalid credit values".into(),
             ));
         }
-        if remaining > 0.0 && total > 0.0 && used <= 0.0 {
-            used = (total - remaining).max(0.0);
-        }
-        if used < 0.0 {
-            used = 0.0;
-        }
-        if total < 0.0 {
-            total = 0.0;
-        }
-        if remaining < 0.0 {
-            remaining = (total - used).max(0.0);
-        }
+        let used = used.max(0.0);
+        let remaining = remaining.max(0.0);
         Ok(CreditTotals {
             total,
             used,
@@ -596,22 +596,15 @@ fn totals_from_cache_json(value: &Value) -> Result<CreditTotals, ProviderError> 
             "cb_credits.json invalid total: {total}"
         )));
     }
-    let used = number_field(value, &["used"]).unwrap_or(0.0).max(0.0);
-    let remaining = number_field(value, &["remaining"])
-        .map(|r| r.max(0.0))
-        .unwrap_or_else(|| (total - used).max(0.0));
+    let used = number_field(value, &["used"]);
+    let remaining = number_field(value, &["remaining"]);
     // Prefer real package expiry from cache if present; do not treat updatedAt
     // as a quota reset (that previously looked like a bogus reset countdown).
     let reset = value
         .get("resetsAt")
         .and_then(|v| v.as_str())
         .and_then(parse_datetime);
-    Ok(CreditTotals {
-        total,
-        used,
-        remaining,
-        reset,
-    })
+    CreditTotals::normalized(total, used, remaining, reset)
 }
 
 fn write_credits_cache(
@@ -1286,5 +1279,46 @@ mod tests {
         unsafe {
             std::env::remove_var("CB_CREDITS_FILE");
         }
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    fn payload(accounts: Value) -> Value {
+        json!({"code":0,"data":{"Response":{"Data":{"Accounts":accounts}}}})
+    }
+    #[test]
+    fn cx289a_missing_api_counter_is_rejected() {
+        assert!(totals_from_api_payload(&payload(json!([{"CapacitySize":100}]))).is_err());
+        assert!(totals_from_api_payload(&payload(json!([{"CapacityUsed":0}]))).is_err());
+        assert!(
+            totals_from_api_payload(&payload(json!([
+                {"CapacitySize":100,"CapacityUsed":0},{"CapacitySize":100}
+            ])))
+            .is_err()
+        );
+    }
+    #[test]
+    fn cx289a_cache_requires_counter_and_derives_used() {
+        assert!(totals_from_cache_json(&json!({"total":100})).is_err());
+        let totals = totals_from_cache_json(&json!({"total":100,"remaining":75})).unwrap();
+        assert_eq!(snapshot_from_totals(&totals).primary.used_percent, 25.0);
+        let exhausted =
+            totals_from_api_payload(&payload(json!([{"CapacitySize":100,"CapacityRemain":0}])))
+                .unwrap();
+        assert_eq!(snapshot_from_totals(&exhausted).primary.used_percent, 100.0);
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved() {
+        let totals =
+            totals_from_api_payload(&payload(json!([{"CapacitySize":100,"CapacityUsed":0}])))
+                .unwrap();
+        let snapshot = snapshot_from_totals(&totals);
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
+        let totals = totals_from_cache_json(&json!({"total":100,"used":0})).unwrap();
+        assert_eq!(snapshot_from_totals(&totals).primary.used_percent, 0.0);
     }
 }

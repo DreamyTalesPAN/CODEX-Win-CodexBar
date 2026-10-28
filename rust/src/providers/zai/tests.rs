@@ -390,7 +390,7 @@ fn plan_name_falls_back_to_level_key() {
         "code": 200,
         "data": {
             "level": "GLM Coding Plan",
-            "limits": []
+            "limits": [{"type":"TOKENS_LIMIT","percentage":0}]
         }
     }))
     .unwrap();
@@ -400,7 +400,7 @@ fn plan_name_falls_back_to_level_key() {
     for key in ["plan", "plan_type", "packageName"] {
         let quota: ZaiQuotaResponse = serde_json::from_value(serde_json::json!({
             "code": 200,
-            "data": { key: "Coding Plan", "limits": [] }
+            "data": { key: "Coding Plan", "limits": [{"type":"TOKENS_LIMIT","percentage":0}] }
         }))
         .unwrap();
         let usage = provider.parse_quota_response(&quota).unwrap();
@@ -413,7 +413,7 @@ fn empty_plan_fields_fall_back_to_default() {
     let provider = ZaiProvider::new();
     let quota: ZaiQuotaResponse = serde_json::from_value(serde_json::json!({
         "code": 200,
-        "data": { "planName": "  ", "level": "", "limits": [] }
+        "data": { "planName": "  ", "level": "", "limits": [{"type":"TOKENS_LIMIT","percentage":0}] }
     }))
     .unwrap();
     let usage = provider.parse_quota_response(&quota).unwrap();
