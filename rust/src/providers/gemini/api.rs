@@ -486,7 +486,9 @@ impl GeminiApi {
         } else if let Some((_, (frac, reset))) = model_quotas.iter().next() {
             (*frac, reset.clone())
         } else {
-            (1.0, None)
+            return Err(ProviderError::Parse(
+                "No usable quota fractions in response".to_string(),
+            ));
         };
 
         let primary_percent_used = (1.0 - primary_fraction) * 100.0;
@@ -842,5 +844,32 @@ mod tests {
             resolve_account_plan(&status, Some("example.com")),
             Some("Workspace".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    fn parse(
+        body: &str,
+    ) -> Result<(RateWindow, Option<RateWindow>, Option<String>), ProviderError> {
+        let response: QuotaResponse = serde_json::from_str(body).expect("quota body");
+        GeminiApi::new().parse_quota_response(response, None)
+    }
+
+    #[test]
+    fn buckets_without_a_fraction_are_an_error_not_zero_percent() {
+        assert!(parse(r#"{"buckets":[{}]}"#).is_err());
+        assert!(parse(r#"{"buckets":[{"modelId":"gemini-pro"}]}"#).is_err());
+        assert!(parse(r#"{"buckets":[{"remainingFraction":0.5}]}"#).is_err());
+    }
+
+    #[test]
+    fn full_remaining_fraction_stays_a_zero_percent_quota() {
+        let (primary, _, _) =
+            parse(r#"{"buckets":[{"modelId":"gemini-pro","remainingFraction":1.0}]}"#)
+                .expect("quota");
+        assert_eq!(primary.used_percent, 0.0);
     }
 }

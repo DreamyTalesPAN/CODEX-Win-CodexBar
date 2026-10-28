@@ -179,11 +179,11 @@ impl CursorApi {
                     // Upstream #2255: clamp plan usage at 100% when included usage
                     // exceeds the plan limit (overage must not paint >100% bars).
                     let percent = if let Some(percent) = plan.total_percent_used {
-                        clamp_percent(percent)
+                        Some(clamp_percent(percent))
                     } else if limit_cents > 0.0 {
-                        clamp_percent((used_cents / limit_cents) * 100.0)
+                        Some(clamp_percent((used_cents / limit_cents) * 100.0))
                     } else {
-                        0.0
+                        None
                     };
 
                     let secondary = plan.auto_percent_used.map(|v| {
@@ -218,24 +218,27 @@ impl CursorApi {
 
                     (percent, secondary, model_specific, Some(cost))
                 } else if let Some(overall) = &individual.overall {
-                    let percent = Self::usage_percent(overall).unwrap_or(0.0);
+                    let percent = Self::usage_percent(overall);
                     let cost = Self::on_demand_cost(Some(overall), billing_end);
                     (percent, None, None, cost)
                 } else {
-                    (0.0, None, None, None)
+                    (None, None, None, None)
                 }
             } else if let Some(team) = &summary.team_usage {
                 if let Some(pooled) = &team.pooled {
-                    let percent = Self::usage_percent(pooled).unwrap_or(0.0);
+                    let percent = Self::usage_percent(pooled);
                     let cost = Self::on_demand_cost(Some(pooled), billing_end);
                     (percent, None, None, cost)
                 } else {
-                    (0.0, None, None, None)
+                    (None, None, None, None)
                 }
             } else {
-                (0.0, None, None, None)
+                (None, None, None, None)
             };
 
+        let percent_used = percent_used.ok_or_else(|| {
+            ProviderError::Parse("Cursor usage summary has no usable quota".to_string())
+        })?;
         let primary = RateWindow::with_details(percent_used, None, billing_end, None);
 
         let plan_type = summary
@@ -708,22 +711,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_build_result_missing_plan() {
-        let json = r#"{
-            "membershipType": "hobby",
-            "individualUsage": {}
-        }"#;
-
-        let summary = parse_summary(json);
-        let result = api().build_result(summary, None).unwrap();
-
-        assert!((result.primary.used_percent).abs() < 0.01);
-        assert!(result.secondary.is_none());
-        assert!(result.model_specific.is_none());
-        assert!(result.cost.is_none());
-    }
-
-    #[test]
     fn test_cursor_on_demand_as_cost() {
         let json = r#"{
             "billingCycleEnd": "2026-04-01T00:00:00Z",
@@ -791,5 +778,42 @@ mod tests {
         let result = api().build_result(summary, None).unwrap();
         assert!((result.primary.used_percent - 50.0).abs() < 0.01);
         assert_eq!(result.cost.unwrap().used, 50.0);
+    }
+}
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    fn build(body: &str) -> Result<CursorUsageResult, ProviderError> {
+        let summary: UsageSummary = serde_json::from_str(body).expect("summary");
+        CursorApi::new().build_result(summary, None)
+    }
+
+    #[test]
+    fn summary_without_a_quota_is_an_error_not_zero_percent() {
+        for body in [
+            r#"{}"#,
+            r#"{"individualUsage":{}}"#,
+            r#"{"individualUsage":{"plan":{"used":500}}}"#,
+            r#"{"individualUsage":{"overall":{"used":5}}}"#,
+            r#"{"teamUsage":{}}"#,
+            r#"{"teamUsage":{"pooled":{"used":5}}}"#,
+        ] {
+            assert!(build(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        for body in [
+            r#"{"individualUsage":{"plan":{"used":0,"limit":2000}}}"#,
+            r#"{"individualUsage":{"plan":{"totalPercentUsed":0}}}"#,
+            r#"{"individualUsage":{"overall":{"used":0,"limit":2000}}}"#,
+            r#"{"teamUsage":{"pooled":{"used":0,"limit":2000}}}"#,
+        ] {
+            let result = build(body).expect(body);
+            assert_eq!(result.primary.used_percent, 0.0, "{body}");
+        }
     }
 }
