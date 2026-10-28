@@ -112,13 +112,7 @@ impl DeepInfraSnapshot {
             .filter(|limit| *limit > 0.0 && limit.is_finite())
         {
             Some(limit) => RateWindow::with_details(
-                // Upstream #2822: balance depletion stays the hard 100 % signal.
-                if self.suspended || self.amount_owed_usd > 0.0 || self.available_balance_usd <= 0.0
-                {
-                    100.0
-                } else {
-                    (self.recent_cost_usd / limit * 100.0).clamp(0.0, 100.0)
-                },
+                (self.recent_cost_usd / limit * 100.0).clamp(0.0, 100.0),
                 None,
                 None,
                 Some(detail),
@@ -492,7 +486,7 @@ mod section_b_tests {
     }
 
     #[test]
-    fn depleted_or_suspended_account_with_a_limit_stays_exhausted() {
+    fn depleted_or_suspended_account_preserves_measured_quota() {
         for checklist in [
             r#"{"stripe_balance":2,"recent":1,"limit":10}"#,
             r#"{"stripe_balance":-20,"recent":1,"limit":10,"suspended":true}"#,
@@ -501,12 +495,40 @@ mod section_b_tests {
                 .unwrap()
                 .to_usage_snapshot();
             assert!(!snapshot.primary.is_informational, "{checklist}");
-            assert_eq!(snapshot.primary.used_percent, 100.0, "{checklist}");
+            assert_eq!(snapshot.primary.used_percent, 10.0, "{checklist}");
         }
     }
 
     #[test]
     fn missing_billing_fields_are_rejected() {
         assert!(parse_snapshot_for_testing(r#"{"limit":10}"#, r#"{"months":[]}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod p1_15_account_status_does_not_override_measured_usage_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_15_account_status_does_not_override_measured_usage() {
+        for recent in [0, 1] {
+            for (balance, suspended) in [(-20, true), (0, false)] {
+                let value = serde_json::json!({"stripe_balance":balance,"recent":recent,"limit":10,"suspended":suspended});
+                let parsed =
+                    parse_snapshot_for_testing(&value.to_string(), r#"{"months":[]}"#).unwrap();
+                let snapshot = parsed.to_usage_snapshot();
+                assert!(!snapshot.primary.is_informational);
+                assert_eq!(snapshot.primary.used_percent, f64::from(recent) * 10.0);
+                assert_eq!(parsed.to_cost_snapshot().unwrap().used, f64::from(recent));
+                if suspended {
+                    assert!(
+                        snapshot
+                            .primary
+                            .reset_description
+                            .unwrap()
+                            .contains("Suspended")
+                    );
+                }
+            }
+        }
     }
 }
