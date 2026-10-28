@@ -104,20 +104,22 @@ fn snapshot_from_usage(usage: &CrofUsageResponse) -> UsageSnapshot {
     } else {
         format!("${credits:.4}")
     };
-    let mut primary = RateWindow::new(if credits > 0.0 { 0.0 } else { 100.0 });
-    primary.reset_description = Some(display.clone());
+    let primary = RateWindow::informational(display.clone());
 
     let mut snapshot = UsageSnapshot::new(primary).with_login_method(format!("{display} balance"));
 
     if let (Some(plan), Some(usable)) = (usage.requests_plan, usage.usable_requests) {
-        let remaining = usable.max(0.0).min(plan.max(0.0));
-        let remaining_percent = if plan > 0.0 {
-            ((remaining / plan) * 100.0).clamp(0.0, 100.0)
+        let requests = if plan > 0.0 {
+            let remaining = usable.max(0.0).min(plan);
+            RateWindow::with_details(
+                100.0 - ((remaining / plan) * 100.0).clamp(0.0, 100.0),
+                None,
+                None,
+                Some(format!("{remaining:.0} requests left")),
+            )
         } else {
-            0.0
+            RateWindow::informational(format!("{:.0} requests left", usable.max(0.0)))
         };
-        let mut requests = RateWindow::new(100.0 - remaining_percent);
-        requests.reset_description = Some(format!("{remaining:.0} requests left"));
         snapshot = snapshot.with_secondary(requests);
     }
 
@@ -236,13 +238,52 @@ mod tests {
     }
 
     #[test]
-    fn crof_zero_balance_is_exhausted() {
+    fn crof_zero_balance_is_informational() {
         let snapshot = snapshot_from_usage(&CrofUsageResponse {
             credits: 0.0,
             requests_plan: None,
             usable_requests: None,
         });
-        assert_eq!(snapshot.primary.used_percent, 100.0);
+        assert!(snapshot.primary.is_informational);
         assert_eq!(snapshot.primary.reset_description.as_deref(), Some("$0.00"));
+    }
+}
+
+#[cfg(test)]
+mod cx289b_tests {
+    use super::*;
+    #[test]
+    fn balance_without_quota_is_informational() {
+        for credits in [0.0, 12.5] {
+            let snapshot = snapshot_from_usage(&CrofUsageResponse {
+                credits,
+                requests_plan: None,
+                usable_requests: None,
+            });
+            assert!(snapshot.primary.is_informational);
+            assert!(snapshot.secondary.is_none());
+        }
+    }
+    #[test]
+    fn request_count_without_positive_plan_is_informational() {
+        for plan in [0.0, -1.0] {
+            let snapshot = snapshot_from_usage(&CrofUsageResponse {
+                credits: 12.5,
+                requests_plan: Some(plan),
+                usable_requests: Some(10.0),
+            });
+            assert!(snapshot.secondary.unwrap().is_informational);
+        }
+    }
+    #[test]
+    fn real_zero_requests_stays_quota() {
+        let snapshot = snapshot_from_usage(&CrofUsageResponse {
+            credits: 12.5,
+            requests_plan: Some(100.0),
+            usable_requests: Some(100.0),
+        });
+        let window = snapshot.secondary.unwrap();
+        assert!(!window.is_informational);
+        assert_eq!(window.used_percent, 0.0);
     }
 }
