@@ -44,12 +44,6 @@ struct CostsResponse {
 
 #[derive(Debug, Deserialize)]
 struct CostBucket {
-    start_time: i64,
-    #[allow(
-        dead_code,
-        reason = "field present in the OpenAI API billing payload; kept so serde preserves it"
-    )]
-    end_time: i64,
     results: Vec<CostResult>,
 }
 
@@ -71,12 +65,6 @@ struct CompletionsUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct CompletionsUsageBucket {
-    start_time: i64,
-    #[allow(
-        dead_code,
-        reason = "field present in the OpenAI API billing payload; kept so serde preserves it"
-    )]
-    end_time: i64,
     results: Vec<CompletionsUsageResult>,
 }
 
@@ -246,13 +234,6 @@ impl OpenAIApiProvider {
 }
 
 fn result_from_grants(grants: &CreditGrantsResponse) -> ProviderFetchResult {
-    let used_percent = if grants.total_granted > 0.0 {
-        grants.total_used / grants.total_granted * 100.0
-    } else if grants.total_available > 0.0 {
-        0.0
-    } else {
-        100.0
-    };
     let next_expiry = grants.grants.as_ref().and_then(|list| {
         list.data
             .iter()
@@ -262,15 +243,17 @@ fn result_from_grants(grants: &CreditGrantsResponse) -> ProviderFetchResult {
             .min()
     });
 
-    let mut primary = RateWindow::with_details(
-        used_percent,
-        None,
-        next_expiry,
-        Some(format!("${:.2} available", grants.total_available.max(0.0))),
-    );
-    if grants.total_granted <= 0.0 && grants.total_available > 0.0 {
-        primary.used_percent = 0.0;
-    }
+    let detail = format!("${:.2} available", grants.total_available.max(0.0));
+    let primary = if grants.total_granted > 0.0 {
+        RateWindow::with_details(
+            grants.total_used / grants.total_granted * 100.0,
+            None,
+            next_expiry,
+            Some(detail),
+        )
+    } else {
+        RateWindow::informational(detail)
+    };
 
     let usage = UsageSnapshot::new(primary).with_login_method(format!(
         "API balance: ${:.2}",
@@ -323,13 +306,6 @@ fn result_from_admin_usage(
         })
         .sum();
 
-    let first_bucket = costs
-        .data
-        .first()
-        .map(|b| b.start_time)
-        .or_else(|| completions.data.first().map(|b| b.start_time));
-    let start = first_bucket.and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-
     let mut model_tokens: HashMap<String, i64> = HashMap::new();
     for result in completions.data.iter().flat_map(|bucket| &bucket.results) {
         let model = result
@@ -361,12 +337,9 @@ fn result_from_admin_usage(
             .unwrap_or(0.0);
     }
 
-    let mut usage = UsageSnapshot::new(RateWindow::with_details(
-        0.0,
-        None,
-        start,
-        Some(format!("${cost_total:.2} over last 30 days")),
-    ))
+    let mut usage = UsageSnapshot::new(RateWindow::informational(format!(
+        "${cost_total:.2} over last 30 days"
+    )))
     .with_extra_rate_window(
         "requests",
         "Requests",
@@ -579,8 +552,6 @@ mod tests {
     fn openai_admin_usage_accepts_numeric_string_cost_amounts() {
         let costs = CostsResponse {
             data: vec![CostBucket {
-                start_time: 1_797_638_400,
-                end_time: 1_797_724_800,
                 results: vec![CostResult {
                     amount: Some(CostAmount {
                         value: serde_json::json!("12.50"),
@@ -591,8 +562,6 @@ mod tests {
         };
         let completions = CompletionsUsageResponse {
             data: vec![CompletionsUsageBucket {
-                start_time: 1_797_638_400,
-                end_time: 1_797_724_800,
                 results: vec![CompletionsUsageResult {
                     model: Some("gpt-5.1".to_string()),
                     input_tokens: Some(100),
@@ -675,5 +644,50 @@ mod tests {
             "plain text failure"
         );
         assert_eq!(response_error_detail("  "), "");
+    }
+}
+
+#[cfg(test)]
+mod informational_tests {
+    use super::*;
+    #[test]
+    fn balance_without_denominator_is_information() {
+        for available in [0.0, 20.0] {
+            let result = result_from_grants(&CreditGrantsResponse {
+                total_granted: 0.0,
+                total_used: 0.0,
+                total_available: available,
+                grants: None,
+            });
+            assert!(result.usage.primary.is_informational);
+        }
+        assert!(serde_json::from_str::<CreditGrantsResponse>("{}").is_err());
+    }
+    #[test]
+    fn admin_costs_are_information_without_quota_reset() {
+        let costs = serde_json::from_str(
+            r#"{"data":[{"start_time":1000,"end_time":2000,"results":[{"amount":{"value":5}}]}]}"#,
+        )
+        .unwrap();
+        let result = result_from_admin_usage(
+            &costs,
+            &CompletionsUsageResponse { data: vec![] },
+            Utc::now(),
+            None,
+        );
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.primary.resets_at.is_none());
+        assert_eq!(result.cost.unwrap().used, 5.0);
+    }
+    #[test]
+    fn real_zero_grant_usage_stays_available() {
+        let result = result_from_grants(&CreditGrantsResponse {
+            total_granted: 100.0,
+            total_used: 0.0,
+            total_available: 100.0,
+            grants: None,
+        });
+        assert!(!result.usage.primary.is_informational);
+        assert_eq!(result.usage.primary.used_percent, 0.0);
     }
 }
