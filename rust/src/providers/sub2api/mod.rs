@@ -660,12 +660,7 @@ fn snapshot_from_parsed(parsed: ParsedUsage) -> ProviderFetchResult {
         snapshot = snapshot.with_extra_rate_window(
             "expires",
             "Expires",
-            RateWindow::with_details(
-                0.0,
-                None,
-                Some(expires_at),
-                Some(expires_at.format("%Y-%m-%d").to_string()),
-            ),
+            RateWindow::informational(expires_at.format("%Y-%m-%d").to_string()),
         );
     }
 
@@ -910,6 +905,37 @@ mod tests {
                 .iter()
                 .any(|w| w.id == "expires")
         );
+    }
+
+    #[test]
+    fn expiry_is_information_not_a_quota_window() {
+        let json = r#"
+        {
+          "mode": "unrestricted",
+          "isValid": true,
+          "subscription": {
+            "daily_usage_usd": 2,
+            "daily_limit_usd": 10,
+            "expires_at": "2026-08-15T00:00:00Z"
+          }
+        }
+        "#;
+
+        let result = snapshot_from_parsed(parse_usage_body(json).unwrap());
+        let expires = result
+            .usage
+            .extra_rate_windows
+            .iter()
+            .find(|w| w.id == "expires")
+            .expect("expires window");
+        assert!(expires.window.is_informational);
+        assert_eq!(expires.window.resets_at, None);
+        assert_eq!(
+            expires.window.reset_description.as_deref(),
+            Some("2026-08-15")
+        );
+        assert!(!result.usage.primary.is_informational);
+        assert!((result.usage.primary.used_percent - 20.0).abs() < f64::EPSILON);
     }
 
     #[test]

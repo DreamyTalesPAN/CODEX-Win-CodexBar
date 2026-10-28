@@ -160,35 +160,32 @@ impl OpenCodeGoProvider {
 
     fn parse_usage_text(text: &str) -> Result<UsageSnapshot, ProviderError> {
         let now = Utc::now();
+        let reset_at =
+            |seconds: Option<i64>| seconds.map(|seconds| now + chrono::Duration::seconds(seconds));
 
         let rolling = Self::extract_window(text, &["rollingUsage", "rolling_usage", "rolling"])
             .ok_or_else(|| ProviderError::Parse("Missing rolling usage window".to_string()))?;
         let weekly = Self::extract_window(text, &["weeklyUsage", "weekly_usage", "weekly"]);
         let monthly = Self::extract_window(text, &["monthlyUsage", "monthly_usage", "monthly"]);
 
-        let primary = RateWindow::with_details(
-            rolling.0,
-            Some(300),
-            Some(now + chrono::Duration::seconds(rolling.1)),
-            None,
-        );
+        let primary = RateWindow::with_details(rolling.0, Some(300), reset_at(rolling.1), None);
         let mut snap = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
 
         if let Some((pct, reset)) = weekly {
             snap = snap.with_secondary(RateWindow::with_details(
                 pct,
                 Some(10080),
-                Some(now + chrono::Duration::seconds(reset)),
+                reset_at(reset),
                 None,
             ));
         }
 
         if let Some((pct, reset)) = monthly {
-            let resets_at = now + chrono::Duration::seconds(reset);
+            let resets_at = reset_at(reset);
             snap = snap.with_tertiary(RateWindow::with_details(
                 pct,
-                RateWindow::monthly_window_minutes(Some(resets_at)).or(Some(43200)),
-                Some(resets_at),
+                RateWindow::monthly_window_minutes(resets_at).or(Some(43200)),
+                resets_at,
                 None,
             ));
         }
@@ -204,8 +201,8 @@ impl OpenCodeGoProvider {
         Ok(snap)
     }
 
-    /// Extract `(percent, resetInSec)` for a usage block by name.
-    fn extract_window(text: &str, names: &[&str]) -> Option<(f64, i64)> {
+    /// Extract `(percent, resetInSec if present)` for a usage block by name.
+    fn extract_window(text: &str, names: &[&str]) -> Option<(f64, Option<i64>)> {
         for name in names {
             let percent_pattern = format!(
                 r#"{}[^}}]*?(?:usagePercent|usedPercent|percentUsed|percent)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)"#,
@@ -222,11 +219,9 @@ impl OpenCodeGoProvider {
                     clippy::cast_possible_truncation,
                     reason = "resetInSec values are whole-second counts scraped as integral numbers"
                 )]
-                let reset = super::extract_number(&reset_pattern, text)
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
+                let reset = super::extract_number(&reset_pattern, text).map(|n| n as i64);
                 // Direct percent fields arrive as integer percent in the serialized payload; no fraction scaling (upstream parseSubscription parity; win-fork #247).
-                return Some((p.clamp(0.0, 100.0), reset.max(0)));
+                return Some((p.clamp(0.0, 100.0), reset.map(|seconds| seconds.max(0))));
             }
 
             // Computed used/limit (already 0..100) — do not apply fraction *100.
@@ -247,11 +242,9 @@ impl OpenCodeGoProvider {
                     clippy::cast_possible_truncation,
                     reason = "resetInSec values are whole-second counts scraped as integral numbers"
                 )]
-                let reset = super::extract_number(&reset_pattern, text)
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
+                let reset = super::extract_number(&reset_pattern, text).map(|n| n as i64);
                 let p = (used / limit) * 100.0;
-                return Some((p.clamp(0.0, 100.0), reset.max(0)));
+                return Some((p.clamp(0.0, 100.0), reset.map(|seconds| seconds.max(0))));
             }
         }
         None
@@ -792,6 +785,25 @@ fn billing_numeric_value(value: &serde_json::Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_without_reset_keeps_reset_unknown() {
+        let text = "rollingUsage: { usagePercent: 10 }, weeklyUsage: { usagePercent: 50, resetInSec: 3600 }, monthlyUsage: { usagePercent: 5 }";
+        let snap = OpenCodeGoProvider::parse_usage_text(text).expect("snapshot");
+        assert_eq!(snap.primary.used_percent, 10.0);
+        assert_eq!(snap.primary.resets_at, None);
+        assert!(snap.secondary.as_ref().unwrap().resets_at.is_some());
+        let monthly = snap.tertiary.as_ref().unwrap();
+        assert_eq!(monthly.used_percent, 5.0);
+        assert_eq!(monthly.resets_at, None);
+    }
+
+    #[test]
+    fn explicit_zero_reset_stays_a_reset() {
+        let text = "rollingUsage: { usagePercent: 10, resetInSec: 0 }";
+        let snap = OpenCodeGoProvider::parse_usage_text(text).expect("snapshot");
+        assert!(snap.primary.resets_at.is_some());
+    }
 
     #[test]
     fn parses_workspace_ids() {

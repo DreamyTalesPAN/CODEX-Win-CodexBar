@@ -269,7 +269,7 @@ fn date_for_time(time: &str, tz_hint: Option<&str>, now: DateTime<Utc>) -> Optio
     let dt = today.and_time(time_only).and_local_timezone(tz).single()?;
     let mut candidate = dt.with_timezone(&Utc);
     if candidate < now {
-        candidate = now + Duration::days(1);
+        candidate += Duration::days(1);
     }
     Some(candidate)
 }
@@ -477,6 +477,19 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn past_clock_time_rolls_the_parsed_time_one_day() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 34, 0).unwrap();
+        assert_eq!(
+            date_for_time("10:00", Some("UTC"), now),
+            Some(Utc.with_ymd_and_hms(2026, 10, 29, 10, 0, 0).unwrap())
+        );
+        assert_eq!(
+            date_for_time("14:00", Some("UTC"), now),
+            Some(Utc.with_ymd_and_hms(2026, 10, 28, 14, 0, 0).unwrap())
+        );
     }
 
     #[test]

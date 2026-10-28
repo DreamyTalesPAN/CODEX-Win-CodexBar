@@ -83,7 +83,8 @@ pub struct LocalUsageSnapshot {
     pub rolling_usage_percent: f64,
     pub weekly_usage_percent: f64,
     pub monthly_usage_percent: f64,
-    pub rolling_reset_in_sec: i64,
+    /// `None` when no usage falls inside the last five hours: no active session, no reset.
+    pub rolling_reset_in_sec: Option<i64>,
     pub weekly_reset_in_sec: i64,
     pub monthly_reset_in_sec: i64,
 }
@@ -94,7 +95,8 @@ impl LocalUsageSnapshot {
         let primary = RateWindow::with_details(
             self.rolling_usage_percent,
             Some(300),
-            Some(now + Duration::seconds(self.rolling_reset_in_sec)),
+            self.rolling_reset_in_sec
+                .map(|seconds| now + Duration::seconds(seconds)),
             None,
         );
         let mut snap = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
@@ -300,8 +302,8 @@ fn snapshot_from_rows(rows: &[UsageRow], now: DateTime<Utc>) -> LocalUsageSnapsh
         }
     }
 
-    let oldest = oldest_session_ms.unwrap_or(now_ms);
-    let rolling_reset_in_sec = ((oldest + FIVE_HOURS_MS - now_ms) / 1000).max(0);
+    let rolling_reset_in_sec =
+        oldest_session_ms.map(|oldest| ((oldest + FIVE_HOURS_MS - now_ms) / 1000).max(0));
 
     LocalUsageSnapshot {
         rolling_usage_percent: percent(session_cost, SESSION_LIMIT_USD),
@@ -612,7 +614,7 @@ mod tests {
             rolling_usage_percent: 12.0,
             weekly_usage_percent: 23.0,
             monthly_usage_percent: 34.0,
-            rolling_reset_in_sec: 300,
+            rolling_reset_in_sec: Some(300),
             weekly_reset_in_sec: 1_000,
             monthly_reset_in_sec: 2_000,
         }
@@ -628,6 +630,34 @@ mod tests {
         assert!(result.usage.primary.resets_at.is_some());
         assert!(result.usage.secondary.as_ref().unwrap().resets_at.is_some());
         assert!(result.usage.tertiary.as_ref().unwrap().resets_at.is_some());
+    }
+
+    #[test]
+    fn local_estimate_without_active_session_has_no_session_reset() {
+        let now = Utc::now();
+        let old = now.timestamp_millis() - 90 * 24 * 60 * 60 * 1000;
+        let rows = [UsageRow {
+            created_ms: old,
+            cost: 3.0,
+            request_count: 1,
+            model: String::new(),
+        }];
+        let result = snapshot_from_rows(&rows, now).to_fetch_result();
+        assert_eq!(
+            result.source_label,
+            super::super::LOCAL_ESTIMATE_SOURCE_LABEL
+        );
+        assert_eq!(result.usage.primary.used_percent, 0.0);
+        assert_eq!(result.usage.primary.resets_at, None);
+
+        let recent = [UsageRow {
+            created_ms: now.timestamp_millis() - 60 * 60 * 1000,
+            cost: 3.0,
+            request_count: 1,
+            model: String::new(),
+        }];
+        let result = snapshot_from_rows(&recent, now).to_fetch_result();
+        assert!(result.usage.primary.resets_at.is_some());
     }
 
     fn temp_db_path(label: &str) -> PathBuf {
