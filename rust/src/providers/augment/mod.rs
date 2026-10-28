@@ -172,14 +172,18 @@ impl AugmentProvider {
             .get("used_credits")
             .or_else(|| json.get("usage"))
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| ProviderError::Parse("Augment response contains no usage counter".into()))?;
+            .ok_or_else(|| {
+                ProviderError::Parse("Augment response contains no usage counter".into())
+            })?;
 
         let limit = json
             .get("credit_limit")
             .or_else(|| json.get("limit"))
             .and_then(|v| v.as_f64())
             .filter(|limit| *limit > 0.0)
-            .ok_or_else(|| ProviderError::Parse("Augment response contains no valid usage limit".into()))?;
+            .ok_or_else(|| {
+                ProviderError::Parse("Augment response contains no valid usage limit".into())
+            })?;
 
         let used_percent = (used / limit) * 100.0;
 

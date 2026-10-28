@@ -113,7 +113,9 @@ impl PerplexityProvider {
         // Waterfall attribution: usage burns recurring first, then bonus, then purchased.
         let mut remaining_usage = resp
             .total_usage_cents
-            .ok_or_else(|| ProviderError::Parse("Perplexity response contains no usage counter".into()))?
+            .ok_or_else(|| {
+                ProviderError::Parse("Perplexity response contains no usage counter".into())
+            })?
             .max(0.0);
         if recurring_total <= 0.0 && bonus_total <= 0.0 && purchased_total <= 0.0 {
             return Err(ProviderError::Parse(
