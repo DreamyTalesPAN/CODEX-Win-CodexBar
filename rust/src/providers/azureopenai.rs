@@ -89,15 +89,20 @@ impl AzureOpenAIProvider {
         let parsed: ChatCompletionResponse = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Parse(format!("Azure OpenAI response parse error: {e}")))?;
 
-        let mut primary = RateWindow::new(0.0);
-        primary.reset_description = Some(Self::detail_text(
+        Ok(Self::snapshot_from_response(&config, &parsed))
+    }
+
+    fn snapshot_from_response(
+        config: &AzureOpenAIConfig,
+        parsed: &ChatCompletionResponse,
+    ) -> UsageSnapshot {
+        let primary = RateWindow::informational(Self::detail_text(
             &config.deployment,
             parsed.model.as_deref(),
         ));
-        let usage = UsageSnapshot::new(primary)
+        UsageSnapshot::new(primary)
             .with_organization(config.endpoint.host_str().unwrap_or_default().to_string())
-            .with_login_method(format!("Deployment: {}", config.deployment));
-        Ok(usage)
+            .with_login_method(format!("Deployment: {}", config.deployment))
     }
 
     fn resolve_config(ctx: &FetchContext) -> Result<AzureOpenAIConfig, ProviderError> {
@@ -362,5 +367,25 @@ mod tests {
         assert!(AzureOpenAIProvider::parse_endpoint("http://example.com").is_err());
         assert!(AzureOpenAIProvider::parse_endpoint("https://user@example.com").is_err());
         assert!(AzureOpenAIProvider::parse_endpoint("https://example.com%2f.evil.test").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cx289b_tests {
+    use super::*;
+
+    #[test]
+    fn deployment_without_quota_is_informational() {
+        let config = AzureOpenAIProvider::parse_saved_config(
+            "synthetic-key|https://example.openai.azure.com|test-deployment",
+        )
+        .unwrap();
+        for json in ["{}", r#"{"model":"test-model"}"#] {
+            let parsed = serde_json::from_str(json).unwrap();
+            let usage = AzureOpenAIProvider::snapshot_from_response(&config, &parsed);
+            assert!(usage.primary.is_informational);
+            assert!(usage.primary.window_minutes.is_none());
+            assert!(usage.primary.resets_at.is_none());
+        }
     }
 }
