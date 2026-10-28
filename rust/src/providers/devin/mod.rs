@@ -149,7 +149,7 @@ fn snapshot_from_quota(value: &Value, org: &str) -> Result<UsageSnapshot, Provid
     let daily = percent(value, &["daily_percentage", "dailyPercentage"])
         .or_else(|| percent(value, &["used_percent", "usedPercent"]));
     let weekly = percent(value, &["weekly_percentage", "weeklyPercentage"]);
-    if daily.is_none() && weekly.is_none() {
+    if daily.is_none() && weekly.is_none() && extra_usage_balance(value).is_none() {
         return Err(ProviderError::Parse(
             "Devin response contains no usable quota".into(),
         ));
@@ -314,6 +314,23 @@ mod cx289a_tests {
             let snap = build(value).unwrap();
             assert!(!snap.primary.is_informational);
             assert_eq!(snap.primary.used_percent, 0.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod p1_02_balance_without_quota_survives_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_02_balance_without_quota_survives() {
+        for (value, amount) in [
+            (serde_json::json!({"overage_balance":12.34}), 12.34),
+            (serde_json::json!({"overage_balance_cents":7087}), 70.87),
+        ] {
+            let result = fetch_result_from_quota(&value, "org/demo").unwrap();
+            assert!(result.usage.primary.is_informational);
+            assert!(result.usage.secondary.is_none());
+            assert_eq!(result.cost.unwrap().used, amount);
         }
     }
 }
