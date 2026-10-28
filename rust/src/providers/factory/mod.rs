@@ -57,14 +57,10 @@ struct FactoryUsageWindow {
 }
 
 impl FactoryUsageWindow {
-    fn percent_used(&self) -> f64 {
-        let used = self.used.unwrap_or(0.0);
-        let allowance = self.allowance.unwrap_or(1.0);
-        if allowance > 0.0 {
-            ((used / allowance) * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        }
+    fn percent_used(&self) -> Option<f64> {
+        let used = self.used?;
+        let allowance = self.allowance.filter(|allowance| *allowance > 0.0)?;
+        Some(((used / allowance) * 100.0).clamp(0.0, 100.0))
     }
 }
 
@@ -78,22 +74,18 @@ struct FactoryTokenUsage {
 }
 
 impl FactoryTokenUsage {
-    fn percent_used(&self) -> f64 {
+    fn percent_used(&self) -> Option<f64> {
         if let Some(ratio) = self.used_ratio.filter(|r| r.is_finite()) {
             if (-0.001..=1.001).contains(&ratio) {
-                return (ratio * 100.0).clamp(0.0, 100.0);
+                return Some((ratio * 100.0).clamp(0.0, 100.0));
             }
             if (-0.1..=100.1).contains(&ratio) {
-                return ratio.clamp(0.0, 100.0);
+                return Some(ratio.clamp(0.0, 100.0));
             }
         }
-        let used = self.user_tokens.unwrap_or(0) as f64;
-        let allowance = self.total_allowance.unwrap_or(0) as f64;
-        if allowance > 0.0 {
-            ((used / allowance) * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        }
+        let used = self.user_tokens? as f64;
+        let allowance = self.total_allowance.filter(|allowance| *allowance > 0)? as f64;
+        Some(((used / allowance) * 100.0).clamp(0.0, 100.0))
     }
 }
 
@@ -124,21 +116,11 @@ struct FactoryLimitPool {
     monthly: FactoryBillingWindow,
 }
 
-impl FactoryLimitPool {
-    fn has_usage_data(&self) -> bool {
-        [&self.five_hour, &self.weekly, &self.monthly]
-            .iter()
-            .any(|w| {
-                w.used_percent > 0.0 || w.window_end.is_some() || w.seconds_remaining.is_some()
-            })
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FactoryBillingWindow {
     #[serde(default)]
-    used_percent: f64,
+    used_percent: Option<f64>,
     #[serde(default)]
     window_end: Option<serde_json::Value>,
     #[serde(default)]
@@ -146,7 +128,8 @@ struct FactoryBillingWindow {
 }
 
 impl FactoryBillingWindow {
-    fn rate_window(&self, window_minutes: Option<u32>) -> RateWindow {
+    fn rate_window(&self, window_minutes: Option<u32>) -> Option<RateWindow> {
+        let used_percent = self.used_percent?;
         let resets_at = self
             .seconds_remaining
             .filter(|s| *s > 0.0 && s.is_finite())
@@ -161,7 +144,7 @@ impl FactoryBillingWindow {
                 Utc::now() + Duration::milliseconds(millis)
             });
         let mut window = RateWindow::with_details(
-            self.used_percent.clamp(0.0, 100.0),
+            used_percent.clamp(0.0, 100.0),
             window_minutes,
             resets_at,
             None,
@@ -169,7 +152,7 @@ impl FactoryBillingWindow {
         if let Some(at) = resets_at {
             window.reset_description = Some(format!("Resets {}", at.format("%b %d at %H:%M UTC")));
         }
-        window
+        Some(window)
     }
 }
 
@@ -521,7 +504,7 @@ impl FactoryProvider {
                     .await)
                 .ok();
             return Ok(Self::apply_auth_info(
-                snapshot_from_billing_limits(&limits, billing.overage_preference.as_deref()),
+                snapshot_from_billing_limits(&limits, billing.overage_preference.as_deref())?,
                 auth,
             ));
         }
@@ -566,7 +549,7 @@ impl FactoryProvider {
             .fetch_usage_api(client, base, None, Some(api_key))
             .await?;
         Ok(Self::apply_auth_info(
-            Self::usage_snapshot_from_response(&usage_data),
+            Self::usage_snapshot_from_response(&usage_data)?,
             auth_info,
         ))
     }
@@ -584,41 +567,49 @@ impl FactoryProvider {
             .await?;
 
         Ok(Self::apply_auth_info(
-            Self::usage_snapshot_from_response(&usage_data),
+            Self::usage_snapshot_from_response(&usage_data)?,
             auth_info,
         ))
     }
 
-    fn usage_snapshot_from_response(usage_data: &FactoryUsageResponse) -> UsageSnapshot {
-        // Prefer nested upstream `usage` only when it carries usable data.
-        // An empty `usage: {}` must not suppress populated top-level windows.
-        if let Some(nested) = &usage_data.usage
-            && nested_usage_has_data(nested)
-        {
-            let standard_percent = nested
-                .standard
-                .as_ref()
-                .map(FactoryTokenUsage::percent_used)
-                .unwrap_or(0.0);
-            let mut usage = UsageSnapshot::new(RateWindow::new(standard_percent));
-            if let Some(premium) = &nested.premium {
-                usage = usage.with_secondary(RateWindow::new(premium.percent_used()));
-            }
-            return usage;
-        }
-
-        let standard_percent = usage_data
-            .standard
+    fn usage_snapshot_from_response(
+        usage_data: &FactoryUsageResponse,
+    ) -> Result<UsageSnapshot, ProviderError> {
+        let standard = usage_data
+            .usage
             .as_ref()
-            .map(FactoryUsageWindow::percent_used)
-            .unwrap_or(0.0);
-
-        let mut usage = UsageSnapshot::new(RateWindow::new(standard_percent));
-        if let Some(premium) = &usage_data.premium {
-            usage = usage.with_secondary(RateWindow::new(premium.percent_used()));
+            .and_then(|nested| nested.standard.as_ref())
+            .and_then(FactoryTokenUsage::percent_used)
+            .or_else(|| {
+                usage_data
+                    .standard
+                    .as_ref()
+                    .and_then(FactoryUsageWindow::percent_used)
+            });
+        let premium = usage_data
+            .usage
+            .as_ref()
+            .and_then(|nested| nested.premium.as_ref())
+            .and_then(FactoryTokenUsage::percent_used)
+            .or_else(|| {
+                usage_data
+                    .premium
+                    .as_ref()
+                    .and_then(FactoryUsageWindow::percent_used)
+            });
+        if standard.is_none() && premium.is_none() {
+            return Err(ProviderError::Parse(
+                "Factory response contains no usable quota".into(),
+            ));
         }
-
-        usage
+        let primary = standard
+            .map(RateWindow::new)
+            .unwrap_or_else(|| RateWindow::informational("Standard usage unavailable"));
+        let mut usage = UsageSnapshot::new(primary);
+        if let Some(premium) = premium {
+            usage = usage.with_secondary(RateWindow::new(premium));
+        }
+        Ok(usage)
     }
 
     fn apply_auth_info(
@@ -689,31 +680,21 @@ impl FactoryProvider {
     }
 }
 
-fn nested_usage_has_data(nested: &FactoryUsageNested) -> bool {
-    let window_has = |w: &FactoryTokenUsage| {
-        w.user_tokens.is_some()
-            || w.total_allowance.is_some()
-            || w.used_ratio.is_some_and(|r| r.is_finite())
-    };
-    nested.standard.as_ref().is_some_and(window_has)
-        || nested.premium.as_ref().is_some_and(window_has)
-}
-
 fn snapshot_from_billing_limits(
     limits: &FactoryTokenRateLimits,
     overage_preference: Option<&str>,
-) -> UsageSnapshot {
+) -> Result<UsageSnapshot, ProviderError> {
     let primary = limits.standard.five_hour.rate_window(Some(5 * 60));
     let secondary = limits.standard.weekly.rate_window(Some(7 * 24 * 60));
     let tertiary = limits.standard.monthly.rate_window(None);
 
-    let mut usage = UsageSnapshot::new(primary)
-        .with_secondary(secondary)
-        .with_tertiary(tertiary);
+    let mut usage = UsageSnapshot::new(
+        primary.unwrap_or_else(|| RateWindow::informational("5-hour usage unavailable")),
+    );
+    usage.secondary = secondary;
+    usage.tertiary = tertiary;
 
-    if let Some(core) = &limits.core
-        && core.has_usage_data()
-    {
+    if let Some(core) = &limits.core {
         for (id, title, window) in [
             (
                 "factory-core-5h",
@@ -731,15 +712,26 @@ fn snapshot_from_billing_limits(
                 core.monthly.rate_window(None),
             ),
         ] {
-            usage = usage.with_extra_rate_window(id, title, window);
+            if let Some(window) = window {
+                usage = usage.with_extra_rate_window(id, title, window);
+            }
         }
     }
 
+    if usage.primary.is_informational
+        && usage.secondary.is_none()
+        && usage.tertiary.is_none()
+        && usage.extra_rate_windows.is_empty()
+    {
+        return Err(ProviderError::Parse(
+            "Factory billing limits contain no usable quota".into(),
+        ));
+    }
     let mut login = "Droid".to_string();
     if let Some(pref) = overage_preference.filter(|p| !p.is_empty()) {
         login = format!("Droid - Fallback: {pref}");
     }
-    usage.with_login_method(login)
+    Ok(usage.with_login_method(login))
 }
 
 impl Default for FactoryProvider {
@@ -907,7 +899,7 @@ mod tests {
         let parsed: FactoryBillingLimitsResponse = serde_json::from_str(body).unwrap();
         assert!(parsed.uses_token_rate_limits_billing);
         let limits = parsed.limits.unwrap();
-        let snap = snapshot_from_billing_limits(&limits, None);
+        let snap = snapshot_from_billing_limits(&limits, None).unwrap();
         assert!((snap.primary.used_percent - 12.0).abs() < f64::EPSILON);
         assert!((snap.secondary.unwrap().used_percent - 34.0).abs() < f64::EPSILON);
         assert!((snap.tertiary.unwrap().used_percent - 56.0).abs() < f64::EPSILON);
@@ -920,7 +912,7 @@ mod tests {
           "premium": { "used": 10.0, "allowance": 50.0 }
         }"#;
         let parsed: FactoryUsageResponse = serde_json::from_str(body).unwrap();
-        let snap = FactoryProvider::usage_snapshot_from_response(&parsed);
+        let snap = FactoryProvider::usage_snapshot_from_response(&parsed).unwrap();
         assert!((snap.primary.used_percent - 25.0).abs() < f64::EPSILON);
         assert!((snap.secondary.unwrap().used_percent - 20.0).abs() < f64::EPSILON);
     }
@@ -934,7 +926,7 @@ mod tests {
           }
         }"#;
         let parsed: FactoryUsageResponse = serde_json::from_str(body).unwrap();
-        let snap = FactoryProvider::usage_snapshot_from_response(&parsed);
+        let snap = FactoryProvider::usage_snapshot_from_response(&parsed).unwrap();
         assert!((snap.primary.used_percent - 30.0).abs() < f64::EPSILON);
         assert!((snap.secondary.unwrap().used_percent - 10.0).abs() < f64::EPSILON);
     }
@@ -947,7 +939,7 @@ mod tests {
           "premium": { "used": 5.0, "allowance": 50.0 }
         }"#;
         let parsed: FactoryUsageResponse = serde_json::from_str(body).unwrap();
-        let snap = FactoryProvider::usage_snapshot_from_response(&parsed);
+        let snap = FactoryProvider::usage_snapshot_from_response(&parsed).unwrap();
         assert!((snap.primary.used_percent - 40.0).abs() < f64::EPSILON);
         assert!((snap.secondary.unwrap().used_percent - 10.0).abs() < f64::EPSILON);
     }
@@ -1024,5 +1016,61 @@ mod tests {
             !redacted.contains("fk-test-key"),
             "factory key must not appear: {redacted}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    fn legacy(value: Value) -> Result<UsageSnapshot, ProviderError> {
+        FactoryProvider::usage_snapshot_from_response(&serde_json::from_value(value).unwrap())
+    }
+    fn billing(value: Value) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_billing_limits(&serde_json::from_value(value).unwrap(), None)
+    }
+    #[test]
+    fn cx289a_legacy_missing_quota_is_error() {
+        for value in [
+            json!({}),
+            json!({"standard":{"allowance":100}}),
+            json!({"standard":{"used":0}}),
+            json!({"usage":{"standard":{"totalAllowance":100}}}),
+            json!({"usage":{"standard":{"userTokens":0}}}),
+        ] {
+            assert!(legacy(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn cx289a_billing_missing_quota_is_error() {
+        assert!(billing(json!({"standard":{"fiveHour":{},"weekly":{},"monthly":{}}})).is_err());
+    }
+    #[test]
+    fn cx289a_secondary_only_keeps_unknown_primary() {
+        let snap = legacy(json!({"premium":{"used":0,"allowance":100}})).unwrap();
+        assert!(snap.primary.is_informational);
+        assert_eq!(snap.secondary.unwrap().used_percent, 0.0);
+        let snap =
+            billing(json!({"standard":{"fiveHour":{},"weekly":{"usedPercent":0},"monthly":{}}}))
+                .unwrap();
+        assert!(snap.primary.is_informational);
+        assert_eq!(snap.secondary.unwrap().used_percent, 0.0);
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        for value in [
+            json!({"standard":{"used":0,"allowance":100}}),
+            json!({"usage":{"standard":{"userTokens":0,"totalAllowance":100}}}),
+            json!({"usage":{"standard":{"usedRatio":0}}}),
+        ] {
+            let snap = legacy(value).unwrap();
+            assert!(!snap.primary.is_informational);
+            assert_eq!(snap.primary.used_percent, 0.0);
+        }
+        let snap =
+            billing(json!({"standard":{"fiveHour":{"usedPercent":0},"weekly":{},"monthly":{}}}))
+                .unwrap();
+        assert!(!snap.primary.is_informational);
+        assert_eq!(snap.primary.used_percent, 0.0);
     }
 }
