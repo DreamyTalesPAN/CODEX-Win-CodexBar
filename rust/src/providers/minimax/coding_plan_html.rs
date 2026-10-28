@@ -396,7 +396,9 @@ pub(super) fn to_usage_snapshot(
         }
         MiniMaxCodingPlanSnapshot::Remains { plan_name, rows } => {
             if rows.is_empty() {
-                return Err(ProviderError::Parse("Missing coding plan data.".into()));
+                return Err(ProviderError::Parse(
+                    "Coding plan response contains no usable usage rows".into(),
+                ));
             }
 
             // Primary = first row with a computable percent (skip placeholders)
@@ -620,5 +622,25 @@ mod tests {
         let usage = to_usage_snapshot(&snapshot, now()).unwrap();
         assert!((usage.primary.used_percent - 25.0).abs() < 0.01);
         assert_eq!(usage.login_method.as_deref(), Some("Text Generation Pro"));
+    }
+}
+
+#[cfg(test)]
+mod p1_13_missing_remaining_never_becomes_exhausted_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_13_missing_remaining_never_becomes_exhausted() {
+        let now = Utc::now();
+        let value = serde_json::json!({"model_remains":[{"model_name":"General","current_interval_total_count":100}]});
+        let parsed = parse_coding_plan_value(&value, now).unwrap();
+        assert!(to_usage_snapshot(&parsed, now).is_err());
+        let value = serde_json::json!({"model_remains":[
+            {"model_name":"General","current_interval_total_count":100},
+            {"model_name":"General","current_interval_total_count":100,"current_interval_usage_count":75}
+        ]});
+        let parsed = parse_coding_plan_value(&value, now).unwrap();
+        let snapshot = to_usage_snapshot(&parsed, now).unwrap();
+        assert_eq!(snapshot.primary.used_percent, 25.0);
+        assert_eq!(snapshot.extra_rate_windows.len(), 1);
     }
 }

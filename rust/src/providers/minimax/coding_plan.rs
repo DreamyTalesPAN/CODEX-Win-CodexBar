@@ -365,7 +365,7 @@ fn make_remains_row(
         used_percent_from_remaining(rp)
     } else {
         let total = total?;
-        let remaining = remaining.unwrap_or(0);
+        let remaining = remaining?;
         used_percent_from_counts(total, remaining)?
     };
 
