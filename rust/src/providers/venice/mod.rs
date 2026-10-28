@@ -101,9 +101,7 @@ fn snapshot_from_balance(balance: &VeniceBalanceResponse) -> Result<UsageSnapsho
             "Venice response contains no balance".into(),
         ));
     }
-    let window = if !balance.can_consume {
-        RateWindow::informational("Balance unavailable for API calls")
-    } else if active_currency == "USD" {
+    let window = if active_currency == "USD" {
         let usd = balance.balances.usd.ok_or_else(|| {
             ProviderError::Parse("Venice response contains no USD balance".into())
         })?;
@@ -127,7 +125,10 @@ fn snapshot_from_balance(balance: &VeniceBalanceResponse) -> Result<UsageSnapsho
             "Venice response contains no balance".into(),
         ));
     };
-    let detail = window.reset_description.clone().unwrap_or_default();
+    let mut detail = window.reset_description.clone().unwrap_or_default();
+    if !balance.can_consume {
+        detail.push_str(" · Balance unavailable for API calls");
+    }
     Ok(UsageSnapshot::new(window).with_login_method(detail))
 }
 
@@ -241,5 +242,25 @@ mod informational_tests {
         let usage = parse(r#"{"canConsume":true,"consumptionCurrency":"DIEM","balances":{"diem":100},"diemEpochAllocation":100}"#).unwrap();
         assert!(!usage.primary.is_informational);
         assert_eq!(usage.primary.used_percent, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod p1_10_disabled_consumption_preserves_diem_quota_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_10_disabled_consumption_preserves_diem_quota() {
+        for (remaining, expected) in [(0, 100.0), (100, 0.0)] {
+            let balance: VeniceBalanceResponse = serde_json::from_value(serde_json::json!({"canConsume":false,"consumptionCurrency":"DIEM","balances":{"diem":remaining},"diemEpochAllocation":100})).unwrap();
+            let snapshot = snapshot_from_balance(&balance).unwrap();
+            assert!(!snapshot.primary.is_informational);
+            assert_eq!(snapshot.primary.used_percent, expected);
+            assert!(
+                snapshot
+                    .login_method
+                    .unwrap()
+                    .contains("unavailable for API calls")
+            );
+        }
     }
 }

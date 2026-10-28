@@ -19,13 +19,13 @@ const MANUS_CREDITS_URL: &str = "https://api.manus.im/user.v1.UserService/GetAva
 #[serde(rename_all = "camelCase")]
 struct ManusCreditsResponse {
     #[serde(default)]
-    total_credits: f64,
+    total_credits: Option<f64>,
     #[serde(default)]
     free_credits: f64,
     #[serde(default)]
     periodic_credits: Option<f64>,
     #[serde(default)]
-    addon_credits: f64,
+    addon_credits: Option<f64>,
     #[serde(default)]
     refresh_credits: Option<f64>,
     #[serde(default)]
@@ -33,7 +33,7 @@ struct ManusCreditsResponse {
     #[serde(default)]
     pro_monthly_credits: Option<f64>,
     #[serde(default)]
-    event_credits: f64,
+    event_credits: Option<f64>,
     #[serde(default)]
     next_refresh_time: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -149,19 +149,26 @@ fn snapshot_from_credits(credits: &ManusCreditsResponse) -> Result<UsageSnapshot
             percent,
             None,
             None,
-            Some(format!(
-                "{:.0} total credits ({:.0} free)",
-                credits.total_credits, credits.free_credits
+            Some(credits.total_credits.map_or_else(
+                || format!("{remaining:.0}/{total:.0} monthly credits"),
+                |balance| {
+                    format!(
+                        "{balance:.0} total credits ({:.0} free)",
+                        credits.free_credits
+                    )
+                },
             )),
         )
+    } else if let Some(balance) = credits.total_credits {
+        RateWindow::informational(format!("{balance:.0} total credits"))
     } else {
         RateWindow::informational("Monthly credit usage unavailable")
     };
 
-    let mut snapshot = UsageSnapshot::new(primary).with_login_method(format!(
-        "Balance: {:.0} credits",
-        credits.total_credits.round()
-    ));
+    let mut snapshot = UsageSnapshot::new(primary);
+    if let Some(balance) = credits.total_credits {
+        snapshot = snapshot.with_login_method(format!("Balance: {:.0} credits", balance.round()));
+    }
 
     if let (Some(total), Some(remaining)) = (
         credits.max_refresh_credits.filter(|total| *total > 0.0),
@@ -186,21 +193,22 @@ fn snapshot_from_credits(credits: &ManusCreditsResponse) -> Result<UsageSnapshot
         snapshot = snapshot.with_secondary(secondary);
     }
 
-    if snapshot.primary.is_informational && snapshot.secondary.is_none() {
-        return Err(ProviderError::Parse(
-            "Manus response contains no usable credit quota".into(),
-        ));
-    }
-
-    if credits.addon_credits > 0.0 {
-        let addon =
-            RateWindow::informational(format!("{:.0} add-on credits", credits.addon_credits));
+    if let Some(balance) = credits.addon_credits {
+        let addon = RateWindow::informational(format!("{balance:.0} add-on credits"));
         snapshot = snapshot.with_extra_rate_window("addon", "Add-on credits", addon);
     }
-    if credits.event_credits > 0.0 {
-        let event =
-            RateWindow::informational(format!("{:.0} event credits", credits.event_credits));
+    if let Some(balance) = credits.event_credits {
+        let event = RateWindow::informational(format!("{balance:.0} event credits"));
         snapshot = snapshot.with_extra_rate_window("event", "Event credits", event);
+    }
+    if snapshot.primary.is_informational
+        && snapshot.secondary.is_none()
+        && credits.total_credits.is_none()
+        && snapshot.extra_rate_windows.is_empty()
+    {
+        return Err(ProviderError::Parse(
+            "Manus response contains no usable credit quota or balance".into(),
+        ));
     }
     Ok(snapshot)
 }
@@ -269,10 +277,63 @@ mod cx289a_tests {
         snapshot_from_credits(&parse_credits(value)?)
     }
     #[test]
+    fn review16_quota_less_response_preserves_all_balances() {
+        let snapshot =
+            build(json!({"totalCredits":47,"addonCredits":40,"eventCredits":7})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("47 total credits")
+        );
+        assert_eq!(
+            snapshot.login_method.as_deref(),
+            Some("Balance: 47 credits")
+        );
+        for (id, description) in [("addon", "40 add-on credits"), ("event", "7 event credits")] {
+            let window = &snapshot
+                .extra_rate_windows
+                .iter()
+                .find(|w| w.id == id)
+                .unwrap()
+                .window;
+            assert!(window.is_informational);
+            assert_eq!(window.reset_description.as_deref(), Some(description));
+        }
+    }
+
+    #[test]
+    fn review16_explicit_zero_balance_is_not_missing() {
+        let snapshot = build(json!({"totalCredits":0})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("0 total credits")
+        );
+        assert!(build(json!({})).is_err());
+    }
+
+    #[test]
+    fn review16_addon_only_does_not_invent_total_balance() {
+        let snapshot = build(json!({"addonCredits":40})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("Monthly credit usage unavailable")
+        );
+        assert!(snapshot.login_method.is_none());
+        assert_eq!(
+            snapshot.extra_rate_windows[0]
+                .window
+                .reset_description
+                .as_deref(),
+            Some("40 add-on credits")
+        );
+    }
+
+    #[test]
     fn cx289a_missing_quota_is_error() {
         for value in [
             json!({}),
-            json!({"totalCredits":100}),
             json!({"proMonthlyCredits":100}),
             json!({"periodicCredits":100}),
             json!({"maxRefreshCredits":100}),

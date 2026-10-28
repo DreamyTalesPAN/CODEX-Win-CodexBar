@@ -163,12 +163,20 @@ impl OpenCodeGoProvider {
         let reset_at =
             |seconds: Option<i64>| seconds.map(|seconds| now + chrono::Duration::seconds(seconds));
 
-        let rolling = Self::extract_window(text, &["rollingUsage", "rolling_usage", "rolling"])
-            .ok_or_else(|| ProviderError::Parse("Missing rolling usage window".to_string()))?;
+        let rolling = Self::extract_window(text, &["rollingUsage", "rolling_usage", "rolling"]);
         let weekly = Self::extract_window(text, &["weeklyUsage", "weekly_usage", "weekly"]);
         let monthly = Self::extract_window(text, &["monthlyUsage", "monthly_usage", "monthly"]);
 
-        let primary = RateWindow::with_details(rolling.0, Some(300), reset_at(rolling.1), None);
+        if rolling.is_none() && weekly.is_none() && monthly.is_none() {
+            return Err(ProviderError::Parse(
+                "OpenCode Go response contains no usable usage windows".into(),
+            ));
+        }
+        let primary = rolling
+            .map(|(percent, reset)| {
+                RateWindow::with_details(percent, Some(300), reset_at(reset), None)
+            })
+            .unwrap_or_else(|| RateWindow::informational("Rolling usage unavailable"));
         let mut snap = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
 
         if let Some((pct, reset)) = weekly {
@@ -989,5 +997,47 @@ mod tests {
         );
         // Marker alone is not enough.
         assert_eq!(parse_billing_server_balance(r#"customerID: "cus_9""#), None);
+    }
+}
+
+#[cfg(test)]
+mod p1_17_weekly_only_preserves_zero_and_nonzero_usage_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_17_weekly_only_preserves_zero_and_nonzero_usage() {
+        for percent in [0, 40] {
+            let snapshot = OpenCodeGoProvider::parse_usage_text(&format!(
+                "weeklyUsage: {{ usagePercent: {percent}, resetInSec: 3600 }}"
+            ))
+            .unwrap();
+            assert!(snapshot.primary.is_informational);
+            assert!(snapshot.primary.resets_at.is_none());
+            let weekly = snapshot.secondary.unwrap();
+            assert!(!weekly.is_informational);
+            assert_eq!(weekly.used_percent, f64::from(percent));
+            assert!(weekly.resets_at.is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod p2_02_empty_usage_is_a_data_error_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_02_empty_usage_is_a_data_error() {
+        let error = OpenCodeGoProvider::parse_usage_text("{}").unwrap_err();
+        assert!(matches!(error, ProviderError::Parse(_)));
+        let text = error.to_string().to_lowercase();
+        for marker in [
+            "missing",
+            "not found",
+            "required",
+            "auth",
+            "token",
+            "cookie",
+            "login",
+        ] {
+            assert!(!text.contains(marker), "{text}");
+        }
     }
 }

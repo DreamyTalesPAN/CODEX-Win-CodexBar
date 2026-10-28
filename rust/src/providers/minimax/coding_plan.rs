@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 use regex_lite::Regex;
 use serde_json::Value;
 
-use crate::core::ProviderError;
+use crate::core::{ProviderError, RateWindow};
 
 use super::{scalar_string, value_f64, value_i64};
 
@@ -56,6 +56,21 @@ pub(super) struct RemainsRow {
     pub reset_description: Option<String>,
     pub is_unlimited: bool,
     pub is_weekly: bool,
+}
+
+impl RemainsRow {
+    pub(super) fn to_rate_window(&self) -> RateWindow {
+        if self.is_unlimited {
+            RateWindow::informational("Unlimited")
+        } else {
+            RateWindow::with_details(
+                self.percent,
+                self.window_minutes,
+                self.resets_at,
+                self.reset_description.clone(),
+            )
+        }
+    }
 }
 
 // ponytail: skipped from upstream — optional `Authorization: Bearer` on cookie
@@ -365,7 +380,7 @@ fn make_remains_row(
         used_percent_from_remaining(rp)
     } else {
         let total = total?;
-        let remaining = remaining.unwrap_or(0);
+        let remaining = remaining?;
         used_percent_from_counts(total, remaining)?
     };
 
@@ -453,7 +468,7 @@ fn parse_resets_at_from_time_range(
             re.replace_all(end_part, "").trim().to_string()
         };
         let time = chrono::NaiveTime::parse_from_str(&end_clean, "%H:%M").ok()?;
-        let today = now.date_naive();
+        let today = now.with_timezone(&tz).date_naive();
         let dt = today.and_time(time).and_local_timezone(tz).single()?;
         let mut candidate = dt.with_timezone(&Utc);
         if candidate < now {
@@ -969,5 +984,19 @@ mod tests {
         assert!(is_token_plan_without_coding_plan(&ProviderError::Other(
             "No Active Token Plan Subscription".to_string()
         )));
+    }
+}
+
+#[cfg(test)]
+mod p2_01_reset_uses_timezone_calendar_date_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_01_reset_uses_timezone_calendar_date() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 18, 0, 0).unwrap();
+        let expected = Utc.with_ymd_and_hms(2026, 10, 29, 17, 0, 0).unwrap();
+        assert_eq!(
+            parse_resets_at_from_time_range("20:00-01:00(UTC+8)", "5 hours", now),
+            Some(expected)
+        );
     }
 }

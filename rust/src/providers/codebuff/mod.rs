@@ -186,6 +186,10 @@ impl CodebuffProvider {
                 });
                 window
             }
+            None if remaining.is_some() => RateWindow::informational(format!(
+                "{} credits remaining; quota unavailable",
+                remaining.unwrap()
+            )),
             None if weekly.is_some() => {
                 RateWindow::informational("Codebuff credit usage unavailable")
             }
@@ -390,12 +394,7 @@ mod cx289a_tests {
 
     #[test]
     fn cx289a_incomplete_quotas_are_rejected() {
-        for payload in [
-            json!({}),
-            json!({"creditsTotal":100}),
-            json!({"remaining":100}),
-            json!({"used":0}),
-        ] {
+        for payload in [json!({}), json!({"creditsTotal":100}), json!({"used":0})] {
             assert!(CodebuffProvider::snapshot_from_values(&payload, None).is_err());
         }
     }
@@ -428,5 +427,19 @@ mod cx289a_tests {
                 .unwrap();
         assert_eq!(snapshot.primary.used_percent, 0.0);
         assert!(!snapshot.primary.is_informational);
+    }
+}
+
+#[cfg(test)]
+mod review16_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_01_remaining_without_quota_is_information() {
+        let snapshot =
+            CodebuffProvider::snapshot_from_values(&json!({"remaining":100}), None).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert!(snapshot.primary.reset_description.unwrap().contains("100"));
+        assert!(snapshot.primary.resets_at.is_none());
+        assert!(snapshot.secondary.is_none());
     }
 }

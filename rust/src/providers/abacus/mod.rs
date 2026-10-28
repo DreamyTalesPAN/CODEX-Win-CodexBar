@@ -41,6 +41,18 @@ struct BillingInfo {
     current_tier: Option<String>,
 }
 
+fn parse_compute_response(body: &str) -> Result<ComputePoints, ProviderError> {
+    let env: ApiEnvelope<ComputePoints> = serde_json::from_str(body)
+        .map_err(|_| ProviderError::Parse("Abacus compute response is invalid".into()))?;
+
+    if !env.success {
+        return Err(ProviderError::AuthRequired);
+    }
+    env.result.ok_or_else(|| {
+        ProviderError::Parse("Abacus response contains no compute points result".into())
+    })
+}
+
 pub struct AbacusProvider {
     metadata: ProviderMetadata,
     client: Client,
@@ -86,12 +98,17 @@ impl AbacusProvider {
             .and_then(|b| b.next_billing_date.as_deref())
             .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
             .map(|dt| dt.with_timezone(&Utc));
-        let primary = RateWindow::with_details(
-            percent,
-            RateWindow::monthly_window_minutes(resets_at).or(Some(FALLBACK_MONTHLY_WINDOW_MINUTES)),
-            resets_at,
-            Some(format_credit_detail(used, total)),
-        );
+        let primary = if total <= 0.0 {
+            RateWindow::informational(format_credit_detail(used, total))
+        } else {
+            RateWindow::with_details(
+                percent,
+                RateWindow::monthly_window_minutes(resets_at)
+                    .or(Some(FALLBACK_MONTHLY_WINDOW_MINUTES)),
+                resets_at,
+                Some(format_credit_detail(used, total)),
+            )
+        };
 
         let mut snapshot = UsageSnapshot::new(primary).with_primary_label(CREDITS_LABEL);
         if let Some(b) = billing
@@ -124,14 +141,7 @@ impl AbacusProvider {
         }
 
         let body = resp.text().await?;
-        let env: ApiEnvelope<ComputePoints> = serde_json::from_str(&body)
-            .map_err(|e| ProviderError::Parse(format!("Failed to parse compute points: {}", e)))?;
-
-        if !env.success {
-            return Err(ProviderError::AuthRequired);
-        }
-        env.result
-            .ok_or_else(|| ProviderError::Parse("Missing compute points result".to_string()))
+        parse_compute_response(&body)
     }
 
     async fn fetch_billing(&self, cookie_header: &str) -> Option<BillingInfo> {
@@ -358,5 +368,48 @@ mod cx289a_tests {
         let snapshot = AbacusProvider::build_snapshot(compute, None).unwrap();
         assert_eq!(snapshot.primary.used_percent, 0.0);
         assert!(!snapshot.primary.is_informational);
+    }
+}
+
+#[cfg(test)]
+mod p1_11_zero_denominator_is_information_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_11_zero_denominator_is_information() {
+        let compute = serde_json::from_value(
+            serde_json::json!({"totalComputePoints":0,"computePointsLeft":0}),
+        )
+        .unwrap();
+        let snapshot = AbacusProvider::build_snapshot(compute, None).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert!(snapshot.primary.window_minutes.is_none());
+        assert!(snapshot.primary.resets_at.is_none());
+    }
+}
+
+#[cfg(test)]
+mod p2_02_incomplete_compute_is_a_data_error_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_02_incomplete_compute_is_a_data_error() {
+        for body in [
+            r#"{"success":true,"result":{"totalComputePoints":100}}"#,
+            r#"{"success":true}"#,
+        ] {
+            let error = parse_compute_response(body).unwrap_err();
+            assert!(matches!(error, ProviderError::Parse(_)));
+            let text = error.to_string().to_lowercase();
+            for marker in [
+                "missing",
+                "not found",
+                "required",
+                "auth",
+                "token",
+                "cookie",
+                "login",
+            ] {
+                assert!(!text.contains(marker), "{text}");
+            }
+        }
     }
 }

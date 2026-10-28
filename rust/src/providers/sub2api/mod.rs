@@ -507,15 +507,19 @@ fn snapshot_from_parsed(parsed: ParsedUsage) -> Result<ProviderFetchResult, Prov
             if primary.is_none()
                 && secondary.is_none()
                 && tertiary.is_none()
+                && parsed.balance.is_none()
+                && parsed.today.is_none()
+                && parsed.total.is_none()
                 && !parsed.rate_limits.iter().any(|window| window.limit > 0.0)
             {
                 return Err(ProviderError::Parse(
                     "Sub2API subscription contains no usage counters".into(),
                 ));
             }
-            let mut snap = UsageSnapshot::new(
-                primary.unwrap_or_else(|| RateWindow::informational("Subscription active")),
-            );
+            let mut snap =
+                UsageSnapshot::new(primary.unwrap_or_else(|| {
+                    RateWindow::informational("Subscription usage unavailable")
+                }));
             if let Some(secondary) = secondary {
                 snap = snap.with_secondary(secondary);
             }
@@ -1153,5 +1157,22 @@ mod cx289a_parent_tests {
     fn zero_denominator_is_not_a_quota() {
         let result = parse(json!({"quota":{"limit":0,"used":0,"remaining":0}}));
         assert!(result.usage.primary.is_informational);
+    }
+}
+
+#[cfg(test)]
+mod p1_08_empty_subscription_preserves_balance_and_usage_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_08_empty_subscription_preserves_balance_and_usage() {
+        let parsed = parse_usage_body(r#"{"subscription":{},"balance":12,"usage":{"today":{"requests":3,"total_tokens":1200,"actual_cost":1.25}}}"#).unwrap();
+        let result = snapshot_from_parsed(parsed).unwrap();
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.secondary.is_none());
+        assert_eq!(result.cost.unwrap().limit, Some(12.0));
+        let text = serde_json::to_string(&result.usage.extra_rate_windows).unwrap();
+        for value in ["3", "1200", "1.25"] {
+            assert!(text.contains(value), "{text}");
+        }
     }
 }
