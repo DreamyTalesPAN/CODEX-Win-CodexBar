@@ -112,7 +112,7 @@ impl Provider for PoeProvider {
                     ],
                 );
                 let mut result =
-                    ProviderFetchResult::new(snapshot_from_balance_at(&value, refresh_now), "api");
+                    ProviderFetchResult::new(snapshot_from_balance_at(&value, refresh_now)?, "api");
                 if ctx.include_credits
                     && let Ok(entries) = fetch_points_history(&self.client, &key, refresh_now).await
                     && let Some(cost) = cost_snapshot_from_history(&entries, balance, refresh_now)
@@ -192,7 +192,10 @@ async fn fetch_points_history(
     Ok(entries)
 }
 
-fn snapshot_from_balance_at(value: &Value, updated_at: DateTime<Utc>) -> UsageSnapshot {
+fn snapshot_from_balance_at(
+    value: &Value,
+    updated_at: DateTime<Utc>,
+) -> Result<UsageSnapshot, ProviderError> {
     let balance = first_number(
         value,
         &[
@@ -201,16 +204,13 @@ fn snapshot_from_balance_at(value: &Value, updated_at: DateTime<Utc>) -> UsageSn
             "balance",
             "points",
         ],
-    );
-    let mut primary = RateWindow::new(0.0);
-    primary.reset_description = balance.map(|v| format!("Balance: {v:.0} points"));
-    let label = primary
-        .reset_description
-        .clone()
-        .unwrap_or_else(|| "Poe API".into());
+    )
+    .ok_or_else(|| ProviderError::Parse("Poe response contains no point balance".into()))?;
+    let label = format!("Balance: {balance:.0} points");
+    let primary = RateWindow::informational(&label);
     let mut snapshot = UsageSnapshot::new(primary).with_login_method(label);
     snapshot.updated_at = updated_at;
-    snapshot
+    Ok(snapshot)
 }
 
 fn history_rows(root: &Value) -> Vec<&Value> {
@@ -369,7 +369,8 @@ mod tests {
         let snapshot = snapshot_from_balance_at(
             &serde_json::json!({"current_point_balance": 1234}),
             Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             snapshot.login_method.as_deref(),
             Some("Balance: 1234 points")
@@ -398,7 +399,8 @@ mod tests {
         let balance_snapshot = snapshot_from_balance_at(
             &serde_json::json!({"current_point_balance": 321}),
             refresh_now,
-        );
+        )
+        .unwrap();
         let cost = cost_snapshot_from_history(&entries, Some(321.0), refresh_now).unwrap();
 
         assert_eq!(balance_snapshot.updated_at, refresh_now);
@@ -426,5 +428,29 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod informational_tests {
+    use super::*;
+    #[test]
+    fn point_balance_is_information() {
+        for balance in [0, 1234] {
+            let usage = snapshot_from_balance_at(
+                &serde_json::json!({"current_point_balance":balance}),
+                Utc::now(),
+            )
+            .unwrap();
+            assert!(usage.primary.is_informational);
+            assert_eq!(
+                usage.primary.reset_description,
+                Some(format!("Balance: {balance} points"))
+            );
+        }
+    }
+    #[test]
+    fn missing_balance_is_an_error() {
+        assert!(snapshot_from_balance_at(&serde_json::json!({}), Utc::now()).is_err());
     }
 }
