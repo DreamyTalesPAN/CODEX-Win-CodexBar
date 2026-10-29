@@ -163,6 +163,31 @@ fn antigravity_extra_windows_preserve_usage_known() {
 }
 
 #[test]
+fn antigravity_unknown_window_exports_usage_known_false() {
+    let resp: UserStatusResponse = serde_json::from_value(serde_json::json!({
+        "userStatus": {
+            "cascadeModelConfigData": {
+                "clientModelConfigs": [
+                    {"label": "Claude 4 Sonnet", "quotaInfo": {"remainingFraction": 0.8}},
+                    {"label": "Gemini 2.5 Pro", "quotaInfo": {"remainingFraction": 0.6}},
+                    {"label": "Gemini 2.5 Flash", "quotaInfo": {"remainingFraction": 0.4}},
+                    {"label": "Claude 3.5 Sonnet", "quotaInfo": {"remainingFraction": null}}
+                ]
+            }
+        }
+    }))
+    .unwrap();
+    let snap = AntigravityProvider::new().parse_user_status(resp).unwrap();
+    let exported = serde_json::to_value(&snap).unwrap();
+    let windows = exported["extra_rate_windows"].as_array().unwrap();
+    assert_eq!(windows.len(), snap.extra_rate_windows.len());
+    assert!(windows.iter().any(|window| window["usageKnown"] == false));
+    for (json, window) in windows.iter().zip(&snap.extra_rate_windows) {
+        assert_eq!(json["usageKnown"], window.usage_known);
+    }
+}
+
+#[test]
 fn test_parse_user_status_standard() {
     let resp = make_response(vec![
         ("Claude 3.5 Sonnet", 0.8),

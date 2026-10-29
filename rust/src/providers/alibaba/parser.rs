@@ -58,14 +58,10 @@ pub(crate) fn parse_response(json: &serde_json::Value) -> Result<UsageSnapshot, 
             .and_then(|ms| Utc.timestamp_opt(ms / 1000, 0).single())
     };
 
-    let pct = |used_key: &str, total_key: &str| -> f64 {
-        let used = quota.get(used_key).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let total = quota.get(total_key).and_then(|v| v.as_f64()).unwrap_or(1.0);
-        if total > 0.0 {
-            (used / total * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        }
+    let pct = |used_key: &str, total_key: &str| -> Option<f64> {
+        let used = quota.get(used_key).and_then(|v| v.as_f64())?;
+        let total = quota.get(total_key).and_then(|v| v.as_f64())?;
+        (total > 0.0).then(|| (used / total * 100.0).clamp(0.0, 100.0))
     };
 
     let detail = |used_key: &str, total_key: &str| -> Option<String> {
@@ -90,30 +86,48 @@ pub(crate) fn parse_response(json: &serde_json::Value) -> Result<UsageSnapshot, 
         ))
     };
 
-    let five_hour = RateWindow::with_details(
-        pct("per5HourUsedQuota", "per5HourTotalQuota"),
-        Some(300),
-        ms_to_dt("per5HourQuotaNextRefreshTime"),
-        detail("per5HourUsedQuota", "per5HourTotalQuota"),
-    );
-    let weekly = RateWindow::with_details(
-        pct("perWeekUsedQuota", "perWeekTotalQuota"),
-        Some(7 * 24 * 60),
-        ms_to_dt("perWeekQuotaNextRefreshTime"),
-        detail("perWeekUsedQuota", "perWeekTotalQuota"),
-    );
-    let monthly_reset = ms_to_dt("perBillMonthQuotaNextRefreshTime");
-    let monthly = RateWindow::with_details(
-        pct("perBillMonthUsedQuota", "perBillMonthTotalQuota"),
-        RateWindow::monthly_window_minutes(monthly_reset).or(Some(30 * 24 * 60)),
-        monthly_reset,
-        detail("perBillMonthUsedQuota", "perBillMonthTotalQuota"),
-    );
-
-    Ok(UsageSnapshot::new(five_hour)
-        .with_secondary(weekly)
-        .with_tertiary(monthly)
-        .with_login_method(plan_name))
+    let five_hour = pct("per5HourUsedQuota", "per5HourTotalQuota").map(|percent| {
+        RateWindow::with_details(
+            percent,
+            Some(300),
+            ms_to_dt("per5HourQuotaNextRefreshTime"),
+            detail("per5HourUsedQuota", "per5HourTotalQuota"),
+        )
+    });
+    let weekly = pct("perWeekUsedQuota", "perWeekTotalQuota").map(|percent| {
+        RateWindow::with_details(
+            percent,
+            Some(7 * 24 * 60),
+            ms_to_dt("perWeekQuotaNextRefreshTime"),
+            detail("perWeekUsedQuota", "perWeekTotalQuota"),
+        )
+    });
+    let monthly = pct("perBillMonthUsedQuota", "perBillMonthTotalQuota").map(|percent| {
+        let reset = ms_to_dt("perBillMonthQuotaNextRefreshTime");
+        RateWindow::with_details(
+            percent,
+            RateWindow::monthly_window_minutes(reset).or(Some(30 * 24 * 60)),
+            reset,
+            detail("perBillMonthUsedQuota", "perBillMonthTotalQuota"),
+        )
+    });
+    if five_hour.is_none() && weekly.is_none() && monthly.is_none() {
+        return Err(ProviderError::Parse(
+            "Alibaba response contains no usable quota".into(),
+        ));
+    }
+    let mut snapshot = UsageSnapshot::new(
+        five_hour
+            .unwrap_or_else(|| RateWindow::informational("Alibaba five-hour usage unavailable")),
+    )
+    .with_login_method(plan_name);
+    if let Some(weekly) = weekly {
+        snapshot = snapshot.with_secondary(weekly);
+    }
+    if let Some(monthly) = monthly {
+        snapshot = snapshot.with_tertiary(monthly);
+    }
+    Ok(snapshot)
 }
 
 fn fmt_tokens(n: i64) -> String {
@@ -246,5 +260,46 @@ mod tests {
         assert_eq!(fmt_tokens(-1), "-1");
         assert_eq!(fmt_tokens(0), "0");
         assert_eq!(fmt_tokens(i64::MIN), "-9,223,372,036,854,775,808");
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    fn payload(quota: serde_json::Value) -> serde_json::Value {
+        json!({"data":{"DataV2":{"data":{"data":{"codingPlanInstanceInfos":[{"codingPlanQuotaInfo":quota}]}}}}})
+    }
+    #[test]
+    fn cx289a_incomplete_quotas_are_rejected() {
+        for quota in [
+            json!({}),
+            json!({"per5HourTotalQuota":100}),
+            json!({"per5HourUsedQuota":0}),
+        ] {
+            assert!(parse_response(&payload(quota)).is_err());
+        }
+    }
+    #[test]
+    fn cx289a_weekly_only_keeps_primary_unknown() {
+        let snapshot = parse_response(&payload(
+            json!({"perWeekUsedQuota":0,"perWeekTotalQuota":100}),
+        ))
+        .unwrap();
+        assert!(snapshot.primary.is_informational);
+        let weekly = snapshot.secondary.unwrap();
+        assert_eq!(weekly.used_percent, 0.0);
+        assert!(!weekly.is_informational);
+        assert!(snapshot.tertiary.is_none());
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved() {
+        let snapshot = parse_response(&payload(
+            json!({"per5HourUsedQuota":0,"per5HourTotalQuota":100}),
+        ))
+        .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
+        assert!(snapshot.secondary.is_none());
     }
 }

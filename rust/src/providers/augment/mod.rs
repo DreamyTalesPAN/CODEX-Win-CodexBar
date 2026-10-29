@@ -172,19 +172,20 @@ impl AugmentProvider {
             .get("used_credits")
             .or_else(|| json.get("usage"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .ok_or_else(|| {
+                ProviderError::Parse("Augment response contains no usage counter".into())
+            })?;
 
         let limit = json
             .get("credit_limit")
             .or_else(|| json.get("limit"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(100.0);
+            .filter(|limit| *limit > 0.0)
+            .ok_or_else(|| {
+                ProviderError::Parse("Augment response contains no valid usage limit".into())
+            })?;
 
-        let used_percent = if limit > 0.0 {
-            (used / limit) * 100.0
-        } else {
-            0.0
-        };
+        let used_percent = (used / limit) * 100.0;
 
         let email = json
             .get("email")
@@ -495,5 +496,30 @@ mod tests {
             )),
             crate::core::ProviderStateKind::NeedsAuthentication
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cx289a_missing_usage_is_rejected() {
+        let provider = AugmentProvider::new();
+        for payload in [
+            json!({}),
+            json!({"credit_limit":100}),
+            json!({"used_credits":0}),
+        ] {
+            assert!(provider.parse_usage_response(&payload).is_err());
+        }
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved() {
+        let snapshot = AugmentProvider::new()
+            .parse_usage_response(&json!({"used_credits":0,"credit_limit":100}))
+            .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

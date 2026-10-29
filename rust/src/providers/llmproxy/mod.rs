@@ -306,27 +306,19 @@ fn parse_summary(data: &[u8]) -> Result<LLMProxySummary, ProviderError> {
 }
 
 fn snapshot_from_summary(summary: &LLMProxySummary) -> UsageSnapshot {
-    let used_percent = summary
-        .minimum_remaining_percent
-        .map(|remaining| (100.0 - remaining).clamp(0.0, 100.0))
-        .unwrap_or(0.0);
-    let mut primary = RateWindow::with_details(used_percent, None, summary.next_reset_at, None);
-    primary.reset_description = summary
-        .minimum_remaining_percent
-        .map(|remaining| format!("{remaining:.1}% minimum remaining"));
-
-    let secondary = RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!("{} requests", format_count(summary.total_requests))),
-    );
-    let tertiary = RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!("{} tokens", format_count(summary.total_tokens))),
-    );
+    let primary = match summary.minimum_remaining_percent {
+        Some(remaining) => RateWindow::with_details(
+            (100.0 - remaining).clamp(0.0, 100.0),
+            None,
+            summary.next_reset_at,
+            Some(format!("{remaining:.1}% minimum remaining")),
+        ),
+        None => RateWindow::informational("Quota unavailable"),
+    };
+    let secondary =
+        RateWindow::informational(format!("{} requests", format_count(summary.total_requests)));
+    let tertiary =
+        RateWindow::informational(format!("{} tokens", format_count(summary.total_tokens)));
 
     let mut snapshot = UsageSnapshot::new(primary)
         .with_secondary(secondary)
@@ -349,7 +341,7 @@ fn snapshot_from_summary(summary: &LLMProxySummary) -> UsageSnapshot {
         snapshot = snapshot.with_extra_rate_window(
             provider.name.clone(),
             provider.name.clone(),
-            RateWindow::with_details(0.0, None, None, Some(detail)),
+            RateWindow::informational(detail),
         );
     }
 
@@ -507,5 +499,41 @@ mod tests {
             reset_time: Some("2026-05-20T00:00:00Z".into()),
         }];
         assert!(next_reset_at_from_groups(&groups, now).is_none());
+    }
+}
+
+#[cfg(test)]
+mod section_b_tests {
+    use super::*;
+
+    #[test]
+    fn counters_without_quota_are_informational() {
+        for body in [
+            r#"{"providers":{}}"#,
+            r#"{"providers":{"openai":{"total_requests":12,"tokens":{"input_cached":2},"approx_cost":3}}}"#,
+        ] {
+            let snapshot = snapshot_from_summary(&parse_summary(body.as_bytes()).unwrap());
+            assert!(snapshot.primary.is_informational);
+            assert!(snapshot.primary.resets_at.is_none());
+            assert!(snapshot.secondary.unwrap().is_informational);
+            assert!(snapshot.tertiary.unwrap().is_informational);
+            assert!(
+                snapshot
+                    .extra_rate_windows
+                    .iter()
+                    .all(|row| row.window.is_informational)
+            );
+        }
+    }
+
+    #[test]
+    fn actual_full_remaining_stays_zero_quota() {
+        let summary = parse_summary(
+            br#"{"providers":{"openai":{"quota_groups":[{"remaining_percent":100}]}}}"#,
+        )
+        .unwrap();
+        let snapshot = snapshot_from_summary(&summary);
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(snapshot.primary.used_percent, 0.0);
     }
 }

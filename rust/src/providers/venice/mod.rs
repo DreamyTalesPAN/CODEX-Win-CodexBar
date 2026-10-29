@@ -85,52 +85,51 @@ impl VeniceProvider {
             .json()
             .await
             .map_err(|e| ProviderError::Parse(format!("Failed to parse Venice balance: {e}")))?;
-        Ok(snapshot_from_balance(&balance))
+        snapshot_from_balance(&balance)
     }
 }
 
-fn snapshot_from_balance(balance: &VeniceBalanceResponse) -> UsageSnapshot {
+fn snapshot_from_balance(balance: &VeniceBalanceResponse) -> Result<UsageSnapshot, ProviderError> {
     let active_currency = balance
         .consumption_currency
         .as_deref()
         .unwrap_or("")
         .to_ascii_uppercase();
 
-    let (used_percent, detail) = if !balance.can_consume {
-        (100.0, "Balance unavailable for API calls".to_string())
-    } else if active_currency == "USD" && balance.balances.usd.unwrap_or(0.0) > 0.0 {
-        (
-            0.0,
-            format!("${:.2} USD remaining", balance.balances.usd.unwrap_or(0.0)),
+    if balance.balances.diem.is_none() && balance.balances.usd.is_none() {
+        return Err(ProviderError::Parse(
+            "Venice response contains no balance".into(),
+        ));
+    }
+    let window = if active_currency == "USD" {
+        let usd = balance.balances.usd.ok_or_else(|| {
+            ProviderError::Parse("Venice response contains no USD balance".into())
+        })?;
+        RateWindow::informational(format!("${usd:.2} USD remaining"))
+    } else if let (Some(diem), Some(allocation)) =
+        (balance.balances.diem, balance.diem_epoch_allocation)
+        && allocation > 0.0
+    {
+        RateWindow::with_details(
+            ((allocation - diem) / allocation * 100.0).clamp(0.0, 100.0),
+            None,
+            None,
+            Some(format!("DIEM {diem:.2} / {allocation:.2} epoch allocation")),
         )
-    } else if active_currency != "USD" {
-        if let (Some(diem), Some(allocation)) =
-            (balance.balances.diem, balance.diem_epoch_allocation)
-            && allocation > 0.0
-        {
-            let used = ((allocation - diem) / allocation * 100.0).clamp(0.0, 100.0);
-            (
-                used,
-                format!("DIEM {:.2} / {:.2} epoch allocation", diem, allocation),
-            )
-        } else if let Some(diem) = balance.balances.diem
-            && diem > 0.0
-        {
-            (0.0, format!("DIEM {diem:.2} remaining"))
-        } else if let Some(usd) = balance.balances.usd
-            && usd > 0.0
-        {
-            (0.0, format!("${usd:.2} USD remaining"))
-        } else {
-            (100.0, "No Venice API balance available".to_string())
-        }
+    } else if let Some(diem) = balance.balances.diem {
+        RateWindow::informational(format!("DIEM {diem:.2} remaining"))
+    } else if let Some(usd) = balance.balances.usd {
+        RateWindow::informational(format!("${usd:.2} USD remaining"))
     } else {
-        (100.0, "No Venice API balance available".to_string())
+        return Err(ProviderError::Parse(
+            "Venice response contains no balance".into(),
+        ));
     };
-
-    let mut window = RateWindow::new(used_percent);
-    window.reset_description = Some(detail.clone());
-    UsageSnapshot::new(window).with_login_method(detail)
+    let mut detail = window.reset_description.clone().unwrap_or_default();
+    if !balance.can_consume {
+        detail.push_str(" · Balance unavailable for API calls");
+    }
+    Ok(UsageSnapshot::new(window).with_login_method(detail))
 }
 
 impl Default for VeniceProvider {
@@ -212,7 +211,56 @@ mod tests {
                 usd: None,
             },
             diem_epoch_allocation: Some(100.0),
-        });
+        })
+        .unwrap();
         assert_eq!(snapshot.primary.used_percent, 75.0);
+    }
+}
+
+#[cfg(test)]
+mod informational_tests {
+    use super::*;
+    fn parse(body: &str) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_balance(&serde_json::from_str(body).unwrap())
+    }
+    #[test]
+    fn balances_without_allocation_are_information() {
+        for body in [
+            r#"{"canConsume":true,"consumptionCurrency":"USD","balances":{"usd":10}}"#,
+            r#"{"canConsume":true,"balances":{"diem":10}}"#,
+            r#"{"canConsume":false,"balances":{"usd":0}}"#,
+        ] {
+            assert!(parse(body).unwrap().primary.is_informational);
+        }
+    }
+    #[test]
+    fn missing_balances_are_an_error() {
+        assert!(parse(r#"{"canConsume":true,"balances":{}}"#).is_err());
+    }
+    #[test]
+    fn real_zero_diem_usage_stays_available() {
+        let usage = parse(r#"{"canConsume":true,"consumptionCurrency":"DIEM","balances":{"diem":100},"diemEpochAllocation":100}"#).unwrap();
+        assert!(!usage.primary.is_informational);
+        assert_eq!(usage.primary.used_percent, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod p1_10_disabled_consumption_preserves_diem_quota_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_10_disabled_consumption_preserves_diem_quota() {
+        for (remaining, expected) in [(0, 100.0), (100, 0.0)] {
+            let balance: VeniceBalanceResponse = serde_json::from_value(serde_json::json!({"canConsume":false,"consumptionCurrency":"DIEM","balances":{"diem":remaining},"diemEpochAllocation":100})).unwrap();
+            let snapshot = snapshot_from_balance(&balance).unwrap();
+            assert!(!snapshot.primary.is_informational);
+            assert_eq!(snapshot.primary.used_percent, expected);
+            assert!(
+                snapshot
+                    .login_method
+                    .unwrap()
+                    .contains("unavailable for API calls")
+            );
+        }
     }
 }

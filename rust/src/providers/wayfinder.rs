@@ -245,46 +245,55 @@ impl Provider for WayfinderProvider {
         // Metrics are best-effort enrichment; a failure must not fail the usage fetch.
         let _metrics = Self::fetch_metrics(&client, &endpoint_url(&base, METRICS_PATH)?).await;
 
-        let wayfinder_usage = WayfinderUsageSnapshot {
-            gateway_status: health.status,
-            offline: health.offline,
-            dry_run: models.dry_run,
-            missing_keys: health.missing_keys,
-            model_count: models.model_count(),
-            models: models.models.into_iter().map(|model| model.name).collect(),
-            requests: savings.requests,
-            estimated_requests: savings.estimated_requests,
-            tokens: savings.tokens,
-            realized: savings.realized,
-            baseline: savings.baseline,
-            saved: savings.saved,
-            saved_percent: savings.saved_pct,
-            period_days: savings.period_days,
-            unit: savings.unit,
-            priced: savings.priced,
-            routes: savings
-                .by_route
-                .into_iter()
-                .map(|(name, route)| WayfinderRouteSummary {
-                    name,
-                    requests: route.requests,
-                    tokens: route.tokens,
-                    realized: route.realized,
-                    baseline: route.baseline,
-                    saved: route.saved,
-                })
-                .collect(),
-        };
-
-        Ok(
-            ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(0.0)), "gateway")
-                .with_wayfinder_usage(wayfinder_usage),
-        )
+        Ok(result_from_gateway(health, models, savings))
     }
 
     fn available_sources(&self) -> Vec<SourceMode> {
         vec![SourceMode::Auto]
     }
+}
+
+fn result_from_gateway(
+    health: HealthResponse,
+    models: ModelsResponse,
+    savings: SavingsResponse,
+) -> ProviderFetchResult {
+    let wayfinder_usage = WayfinderUsageSnapshot {
+        gateway_status: health.status,
+        offline: health.offline,
+        dry_run: models.dry_run,
+        missing_keys: health.missing_keys,
+        model_count: models.model_count(),
+        models: models.models.into_iter().map(|model| model.name).collect(),
+        requests: savings.requests,
+        estimated_requests: savings.estimated_requests,
+        tokens: savings.tokens,
+        realized: savings.realized,
+        baseline: savings.baseline,
+        saved: savings.saved,
+        saved_percent: savings.saved_pct,
+        period_days: savings.period_days,
+        unit: savings.unit,
+        priced: savings.priced,
+        routes: savings
+            .by_route
+            .into_iter()
+            .map(|(name, route)| WayfinderRouteSummary {
+                name,
+                requests: route.requests,
+                tokens: route.tokens,
+                realized: route.realized,
+                baseline: route.baseline,
+                saved: route.saved,
+            })
+            .collect(),
+    };
+
+    ProviderFetchResult::new(
+        UsageSnapshot::new(RateWindow::informational("Gateway statistics; no quota")),
+        "gateway",
+    )
+    .with_wayfinder_usage(wayfinder_usage)
 }
 
 #[cfg(test)]
@@ -351,5 +360,22 @@ mod tests {
         assert!(parse_health("{\"status\":").is_err());
         assert!(parse_models("{\"models\": [").is_err());
         assert!(parse_savings("{\"requests\": \"many\"}").is_err());
+    }
+}
+
+#[cfg(test)]
+mod informational_tests {
+    use super::*;
+    #[test]
+    fn gateway_statistics_are_information() {
+        let result = result_from_gateway(
+            parse_health(include_str!("fixtures/wayfinder/health.json")).unwrap(),
+            parse_models(include_str!("fixtures/wayfinder/models.json")).unwrap(),
+            parse_savings(include_str!("fixtures/wayfinder/savings.json")).unwrap(),
+        );
+        assert!(result.usage.primary.is_informational);
+        assert_eq!(result.wayfinder_usage.unwrap().requests, 14);
+        assert!(parse_health("{}").is_err());
+        assert!(parse_savings("{}").is_err());
     }
 }

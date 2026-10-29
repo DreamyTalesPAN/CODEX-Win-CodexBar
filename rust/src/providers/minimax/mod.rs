@@ -377,19 +377,20 @@ impl MiniMaxProvider {
             .get("used_amount")
             .or_else(|| json.get("total_amount"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .ok_or_else(|| {
+                ProviderError::Parse("MiniMax response contains no usage counter".into())
+            })?;
 
         let credit_limit = json
             .get("total_quota")
             .or_else(|| json.get("quota"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(100.0);
+            .filter(|limit| *limit > 0.0)
+            .ok_or_else(|| {
+                ProviderError::Parse("MiniMax response contains no quota total".into())
+            })?;
 
-        let used_percent = if credit_limit > 0.0 {
-            (used_credits / credit_limit) * 100.0
-        } else {
-            0.0
-        };
+        let used_percent = (used_credits / credit_limit) * 100.0;
 
         let plan = json
             .get("plan_name")
@@ -708,6 +709,12 @@ impl MiniMaxProvider {
         attach_billing_summary(ProviderFetchResult::new(usage, source_label), summary)
     }
 
+    fn configured_usage() -> Result<UsageSnapshot, ProviderError> {
+        Err(ProviderError::Parse(
+            "MiniMax response contains no usage data".into(),
+        ))
+    }
+
     /// Probe for MiniMax installation (credentials check)
     async fn probe_cli(&self) -> Result<UsageSnapshot, ProviderError> {
         // Check if API key is configured
@@ -717,9 +724,7 @@ impl MiniMaxProvider {
             .unwrap_or(false);
 
         if has_env_vars || has_config {
-            let usage =
-                UsageSnapshot::new(RateWindow::new(0.0)).with_login_method("MiniMax (configured)");
-            Ok(usage)
+            Self::configured_usage()
         } else {
             Err(ProviderError::NotInstalled(
                 "MiniMax API not configured. Set MINIMAX_API_KEY and MINIMAX_GROUP_ID environment variables".to_string()
@@ -818,24 +823,14 @@ fn result_from_billing_summary(
     summary: MiniMaxBillingSummary,
     source_label: &str,
 ) -> ProviderFetchResult {
-    let usage = UsageSnapshot::new(RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!(
-            "{} tokens today",
-            format_count(summary.today_tokens)
-        )),
-    ))
-    .with_secondary(RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!(
-            "{} tokens over last 30 days",
-            format_count(summary.last_30_days_tokens)
-        )),
-    ))
+    let usage = UsageSnapshot::new(RateWindow::informational(format!(
+        "{} tokens today",
+        format_count(summary.today_tokens)
+    )))
+    .with_secondary(RateWindow::informational(format!(
+        "{} tokens over last 30 days",
+        format_count(summary.last_30_days_tokens)
+    )))
     .with_login_method("MiniMax billing");
     attach_billing_summary(ProviderFetchResult::new(usage, source_label), summary)
 }
@@ -847,30 +842,25 @@ fn attach_billing_summary(
     result.usage = result.usage.with_extra_rate_window(
         "billing-tokens-today",
         "Tokens today",
-        RateWindow::with_details(0.0, None, None, Some(format_count(summary.today_tokens))),
+        RateWindow::informational(format_count(summary.today_tokens)),
     );
     result.usage = result.usage.with_extra_rate_window(
         "billing-tokens-30d",
         "Tokens (30 days)",
-        RateWindow::with_details(
-            0.0,
-            None,
-            None,
-            Some(format_count(summary.last_30_days_tokens)),
-        ),
+        RateWindow::informational(format_count(summary.last_30_days_tokens)),
     );
     if let Some(cash) = summary.today_cash {
         result.usage = result.usage.with_extra_rate_window(
             "billing-cash-today",
             "Spend today",
-            RateWindow::with_details(0.0, None, None, Some(format!("${cash:.2}"))),
+            RateWindow::informational(format!("${cash:.2}")),
         );
     }
     if let Some(cash) = summary.last_30_days_cash {
         result.usage = result.usage.with_extra_rate_window(
             "billing-cash-30d",
             "Spend (30 days)",
-            RateWindow::with_details(0.0, None, None, Some(format!("${cash:.2}"))),
+            RateWindow::informational(format!("${cash:.2}")),
         );
         result.cost = Some(CostSnapshot::new(cash, "USD", "Last 30 days"));
     }
@@ -878,14 +868,14 @@ fn attach_billing_summary(
         result.usage = result.usage.with_extra_rate_window(
             format!("billing-method-{idx}"),
             format!("Method: {}", item.name),
-            RateWindow::with_details(0.0, None, None, Some(breakdown_description(item))),
+            RateWindow::informational(breakdown_description(item)),
         );
     }
     for (idx, item) in summary.top_models.iter().enumerate() {
         result.usage = result.usage.with_extra_rate_window(
             format!("billing-model-{idx}"),
             format!("Model: {}", item.name),
-            RateWindow::with_details(0.0, None, None, Some(breakdown_description(item))),
+            RateWindow::informational(breakdown_description(item)),
         );
     }
     result
@@ -1206,6 +1196,28 @@ mod tests {
     }
 
     #[test]
+    fn billing_counters_without_a_denominator_are_informational() {
+        let json = serde_json::json!({
+            "base_resp": { "status_code": 0 },
+            "charge_records": [{
+                "consume_token": "2500",
+                "consume_cash_after_voucher": "1.25",
+                "ymd": Utc::now().format("%Y-%m-%d").to_string(),
+                "method": "chat",
+                "model": "abab6.5"
+            }]
+        });
+        let result =
+            result_from_billing_summary(parse_billing_summary(&json).unwrap(), "web-billing");
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.secondary.as_ref().unwrap().is_informational);
+        assert!(!result.usage.extra_rate_windows.is_empty());
+        for extra in &result.usage.extra_rate_windows {
+            assert!(extra.window.is_informational, "{}", extra.id);
+        }
+    }
+
+    #[test]
     fn parses_plan_title_from_coding_plan_fields() {
         let provider = MiniMaxProvider::new();
         for (field, expected) in [
@@ -1305,5 +1317,39 @@ mod tests {
         assert_eq!(summary.top_methods[0].tokens, 3000);
         assert_eq!(summary.top_methods[1].name, "chat");
         assert_eq!(summary.top_methods[1].tokens, 1000);
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn configuration_is_not_usage() {
+        assert!(MiniMaxProvider::configured_usage().is_err());
+    }
+
+    #[test]
+    fn missing_usage_is_an_error() {
+        for value in [
+            json!({}),
+            json!({"total_quota":100}),
+            json!({"used_amount":0}),
+            json!({"used_amount":0,"total_quota":0}),
+        ] {
+            assert!(
+                MiniMaxProvider::new().parse_usage_response(&value).is_err(),
+                "{value}"
+            );
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = MiniMaxProvider::new()
+            .parse_usage_response(&json!({"used_amount":0,"total_quota":100}))
+            .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

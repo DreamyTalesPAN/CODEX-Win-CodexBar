@@ -13,6 +13,10 @@ pub struct WindowPayload {
     /// Display-only hint. Script clients can ignore this additive schema-v1 key.
     #[serde(skip_serializing_if = "is_false")]
     pub idle: bool,
+    /// Informational or unknown lane: `used_percent` / `remaining_percent` are
+    /// placeholders, not a measurement. Additive schema-v1 key.
+    #[serde(skip_serializing_if = "is_false")]
+    pub unavailable: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -33,5 +37,6 @@ pub(super) fn make_window_with_idle(
         remaining_percent: (100.0 - used).clamp(0.0, 100.0),
         reset_at: window.resets_at,
         idle,
+        unavailable: window.is_informational,
     }
 }

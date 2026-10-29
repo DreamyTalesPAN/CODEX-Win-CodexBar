@@ -225,7 +225,7 @@ impl OpenCodeProvider {
                     has_usage_hint,
                     "OpenCode subscription body missing rolling/weekly usage windows"
                 );
-                ProviderError::Parse("Missing usage percent (rolling or weekly)".into())
+                ProviderError::Parse("OpenCode response contains no usable usage windows".into())
             })
     }
 
@@ -233,22 +233,24 @@ impl OpenCodeProvider {
     /// Rolling is preferred as primary; weekly-only becomes primary.
     fn snapshot_from_windows(
         &self,
-        rolling: Option<(f64, i64)>,
-        weekly: Option<(f64, i64)>,
+        rolling: Option<(f64, Option<i64>)>,
+        weekly: Option<(f64, Option<i64>)>,
         now: DateTime<Utc>,
         renews_at: Option<DateTime<Utc>>,
     ) -> Option<UsageSnapshot> {
+        let reset_at =
+            |seconds: Option<i64>| seconds.map(|seconds| now + chrono::Duration::seconds(seconds));
         let primary = match (rolling, weekly) {
             (Some(r), _) => RateWindow::with_details(
                 r.0,
                 Some(300), // 5 hours rolling
-                Some(now + chrono::Duration::seconds(r.1)),
+                reset_at(r.1),
                 None,
             ),
             (None, Some(w)) => RateWindow::with_details(
                 w.0,
                 Some(10080), // weekly used as sole window
-                Some(now + chrono::Duration::seconds(w.1)),
+                reset_at(w.1),
                 None,
             ),
             (None, None) => return None,
@@ -261,7 +263,7 @@ impl OpenCodeProvider {
             usage = usage.with_secondary(RateWindow::with_details(
                 w.0,
                 Some(10080),
-                Some(now + chrono::Duration::seconds(w.1)),
+                reset_at(w.1),
                 None,
             ));
         }
@@ -321,7 +323,7 @@ impl OpenCodeProvider {
     }
 
     /// Find usage window in JSON by keys
-    fn find_usage_window(&self, json: &Value, keys: &[&str]) -> Option<(f64, i64)> {
+    fn find_usage_window(&self, json: &Value, keys: &[&str]) -> Option<(f64, Option<i64>)> {
         for key in keys {
             if let Some(obj) = json.get(key)
                 && let Some(window) = self.parse_window(obj)
@@ -350,15 +352,15 @@ impl OpenCodeProvider {
     }
 
     /// Parse a usage window object
-    fn parse_window(&self, obj: &Value) -> Option<(f64, i64)> {
+    fn parse_window(&self, obj: &Value) -> Option<(f64, Option<i64>)> {
         // Bare number: treat as percent used (0–1 fractions scaled).
         if let Some(n) = obj.as_f64() {
             let percent = if n <= 1.0 { n * 100.0 } else { n };
-            return Some((percent.clamp(0.0, 100.0), 0));
+            return Some((percent.clamp(0.0, 100.0), None));
         }
         let percent = Self::window_percent(obj)?;
-        let reset_sec = Self::window_reset_seconds(obj).unwrap_or(0);
-        Some((percent.clamp(0.0, 100.0), reset_sec.max(0)))
+        let reset_sec = Self::window_reset_seconds(obj).map(|seconds| seconds.max(0));
+        Some((percent.clamp(0.0, 100.0), reset_sec))
     }
 
     fn window_percent(obj: &Value) -> Option<f64> {
@@ -508,7 +510,11 @@ impl OpenCodeProvider {
     }
 
     /// Extract usage via regex patterns (JS-object and JSON-ish payloads).
-    fn extract_usage_regex(&self, text: &str, prefix: &str) -> Result<(f64, i64), ProviderError> {
+    fn extract_usage_regex(
+        &self,
+        text: &str,
+        prefix: &str,
+    ) -> Result<(f64, Option<i64>), ProviderError> {
         // Allow optional quotes around the window key and percent field names,
         // and accept the same percent aliases used by `window_percent`.
         let percent_pattern = format!(
@@ -525,9 +531,7 @@ impl OpenCodeProvider {
             clippy::cast_possible_truncation,
             reason = "resetInSec values are whole-second counts scraped as integral numbers"
         )]
-        let reset = super::extract_number(&reset_pattern, text)
-            .map(|n| n as i64)
-            .unwrap_or(0);
+        let reset = super::extract_number(&reset_pattern, text).map(|n| n as i64);
 
         Ok((percent, reset))
     }
@@ -665,6 +669,42 @@ mod tests {
             renewal.window.resets_at.unwrap().to_rfc3339(),
             "2026-06-01T12:00:00+00:00"
         );
+    }
+
+    #[test]
+    fn percent_without_reset_keeps_reset_unknown() {
+        let provider = OpenCodeProvider::new();
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let json = serde_json::json!({
+            "rollingUsage": { "usagePercent": 10 },
+            "weeklyUsage": { "usagePercent": 50, "resetInSec": 3600 }
+        });
+        let snap = provider.parse_usage_json(&json, now).expect("snapshot");
+        assert_eq!(snap.primary.used_percent, 10.0);
+        assert_eq!(snap.primary.resets_at, None);
+        assert_eq!(
+            snap.secondary.as_ref().unwrap().resets_at,
+            Some(now + chrono::Duration::seconds(3600))
+        );
+
+        let bare = serde_json::json!({ "rollingUsage": 0.25 });
+        let snap = provider.parse_usage_json(&bare, now).expect("snapshot");
+        assert_eq!(snap.primary.used_percent, 25.0);
+        assert_eq!(snap.primary.resets_at, None);
+
+        let text = "rollingUsage: { usagePercent: 10 }, weeklyUsage: { usagePercent: 50 }";
+        let snap = provider.parse_subscription(text).expect("snapshot");
+        assert_eq!(snap.primary.resets_at, None);
+        assert_eq!(snap.secondary.as_ref().unwrap().resets_at, None);
+    }
+
+    #[test]
+    fn explicit_zero_reset_stays_a_reset() {
+        let provider = OpenCodeProvider::new();
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let json = serde_json::json!({ "rollingUsage": { "usagePercent": 10, "resetInSec": 0 } });
+        let snap = provider.parse_usage_json(&json, now).expect("snapshot");
+        assert_eq!(snap.primary.resets_at, Some(now));
     }
 
     #[test]
@@ -830,5 +870,29 @@ mod tests {
             ),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod p2_02_empty_usage_is_a_data_error_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_02_empty_usage_is_a_data_error() {
+        let error = OpenCodeProvider::new()
+            .parse_subscription("{}")
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Parse(_)));
+        let text = error.to_string().to_lowercase();
+        for marker in [
+            "missing",
+            "not found",
+            "required",
+            "auth",
+            "token",
+            "cookie",
+            "login",
+        ] {
+            assert!(!text.contains(marker), "{text}");
+        }
     }
 }

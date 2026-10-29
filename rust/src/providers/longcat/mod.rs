@@ -233,32 +233,23 @@ fn build_snapshot(
 ) -> Result<UsageSnapshot, ProviderError> {
     let account_data = envelope_data(account);
 
-    let (total, used) = if let Some(lot) = token_packs.and_then(active_token_pack_lot) {
-        // Active token-pack lot: consumed/total drive the quota directly.
-        let total = json_f64(&lot, "totalToken")
-            .ok_or_else(|| ProviderError::Parse("token-packs lot missing totalToken".into()))?;
-        let used = json_f64(&lot, "consumedToken").unwrap_or(0.0);
-        (total, used)
-    } else if let Some(usage_raw) = usage_raw {
-        // Legacy token quota: data.usage is the canonical aggregate.
-        let usage_outer = envelope_data(usage_raw);
-        let usage = usage_outer
-            .get("usage")
-            .filter(|u| u.is_object())
-            .unwrap_or(usage_outer);
-        let total = json_f64(usage, "totalToken")
-            .ok_or_else(|| ProviderError::Parse("tokenUsage data was missing totalToken".into()))?;
-        let remaining = json_f64(usage, "availableToken");
-        let used = remaining.map(|r| (total - r).max(0.0)).unwrap_or(0.0);
-        (total, used)
+    let quota = if let Some(lot) = token_packs.and_then(active_token_pack_lot) {
+        // Do not substitute another source when the active lot lacks its counter.
+        json_f64(&lot, "totalToken").zip(json_f64(&lot, "consumedToken"))
     } else {
-        return Err(ProviderError::Parse(
-            "LongCat usage data was missing (no active token-pack lot and no tokenUsage payload)"
-                .into(),
-        ));
+        usage_raw.and_then(|usage_raw| {
+            let usage_outer = envelope_data(usage_raw);
+            let usage = usage_outer
+                .get("usage")
+                .filter(|u| u.is_object())
+                .unwrap_or(usage_outer);
+            let total = json_f64(usage, "totalToken")?;
+            let remaining = json_f64(usage, "availableToken")?;
+            Some((total, (total - remaining).max(0.0)))
+        })
     };
 
-    let primary = if total > 0.0 {
+    let primary = if let Some((total, used)) = quota.filter(|(total, _)| *total > 0.0) {
         let mut w = RateWindow::new(((used / total) * 100.0).clamp(0.0, 100.0));
         // Display-only rendering of token counts; values beyond i64 are
         // unrealistic quota sizes and would only affect this label.
@@ -270,7 +261,7 @@ fn build_snapshot(
         w.reset_description = Some(desc);
         w
     } else {
-        RateWindow::informational("No token quota")
+        RateWindow::informational("Token usage unavailable")
     };
 
     let account_name = json_str(account_data, "name")
@@ -302,6 +293,11 @@ fn build_snapshot(
         }
     }
 
+    if snap.primary.is_informational && snap.secondary.is_none() {
+        return Err(ProviderError::Parse(
+            "LongCat response contains no usable quota".into(),
+        ));
+    }
     Ok(snap)
 }
 
@@ -318,7 +314,7 @@ fn parse_fuel(fuel: &Value) -> Option<(f64, f64, Option<DateTime<Utc>>)> {
         .unwrap_or(0.0);
     let mut package_total = 0.0;
     let mut remaining = 0.0;
-    let mut saw_remaining = false;
+    let mut complete_totals = true;
     let mut nearest: Option<DateTime<Utc>> = None;
 
     for pkg in packages {
@@ -327,13 +323,16 @@ fn parse_fuel(fuel: &Value) -> Option<(f64, f64, Option<DateTime<Utc>>)> {
             .or_else(|| json_f64(pkg, "amount"))
         {
             package_total += t.max(0.0);
+        } else {
+            complete_totals = false;
         }
         if let Some(r) = json_f64(pkg, "availableToken")
             .or_else(|| json_f64(pkg, "remainingToken"))
             .or_else(|| json_f64(pkg, "remaining"))
         {
             remaining += r.max(0.0);
-            saw_remaining = true;
+        } else {
+            return None;
         }
         if let Some(raw) = pkg
             .get("expireTime")
@@ -348,18 +347,16 @@ fn parse_fuel(fuel: &Value) -> Option<(f64, f64, Option<DateTime<Utc>>)> {
         }
     }
 
-    let mut total = if declared_total > 0.0 {
+    let total = if declared_total > 0.0 {
         declared_total
-    } else {
+    } else if complete_totals {
         package_total
+    } else {
+        return None;
     };
-    if total <= 0.0 && !saw_remaining {
+    if total <= 0.0 || packages.is_empty() {
         return None;
     }
-    if total <= 0.0 {
-        total = remaining;
-    }
-    let remaining = if saw_remaining { remaining } else { total };
     Some((total, remaining, nearest))
 }
 
@@ -492,5 +489,59 @@ mod tests {
             normalize_cookie_header("Cookie: a=1; b=2").as_deref(),
             Some("a=1; b=2")
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cx289a_missing_counters_are_error() {
+        assert!(build_snapshot(&json!({}), None, Some(&json!({"totalToken":100})), None).is_err());
+        assert!(
+            build_snapshot(
+                &json!({}),
+                Some(&json!({"currentLot":{"status":"ACTIVE","totalToken":100}})),
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn cx289a_incomplete_fuel_is_not_quota() {
+        for fuel in [
+            json!({"packages":[{"totalToken":100}]}),
+            json!({"packages":[{"availableToken":100}]}),
+            json!({"packages":[{"totalToken":100,"availableToken":50},{"totalToken":100}]}),
+        ] {
+            assert!(parse_fuel(&fuel).is_none(), "{fuel}");
+        }
+    }
+    #[test]
+    fn cx289a_fuel_only_keeps_unknown_primary() {
+        let fuel = json!({"packages":[{"totalToken":100,"availableToken":100}]});
+        for usage in [json!({"totalToken":100}), json!({})] {
+            let snap = build_snapshot(&json!({}), None, Some(&usage), Some(&fuel)).unwrap();
+            assert!(snap.primary.is_informational);
+            let secondary = snap.secondary.unwrap();
+            assert!(!secondary.is_informational);
+            assert_eq!(secondary.used_percent, 0.0);
+        }
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        for (packs, usage) in [
+            (None, Some(json!({"totalToken":100,"availableToken":100}))),
+            (
+                Some(json!({"currentLot":{"status":"ACTIVE","totalToken":100,"consumedToken":0}})),
+                None,
+            ),
+        ] {
+            let snap = build_snapshot(&json!({}), packs.as_ref(), usage.as_ref(), None).unwrap();
+            assert!(!snap.primary.is_informational);
+            assert_eq!(snap.primary.used_percent, 0.0);
+        }
     }
 }

@@ -19,21 +19,21 @@ const MANUS_CREDITS_URL: &str = "https://api.manus.im/user.v1.UserService/GetAva
 #[serde(rename_all = "camelCase")]
 struct ManusCreditsResponse {
     #[serde(default)]
-    total_credits: f64,
+    total_credits: Option<f64>,
     #[serde(default)]
     free_credits: f64,
     #[serde(default)]
-    periodic_credits: f64,
+    periodic_credits: Option<f64>,
     #[serde(default)]
-    addon_credits: f64,
+    addon_credits: Option<f64>,
     #[serde(default)]
-    refresh_credits: f64,
+    refresh_credits: Option<f64>,
     #[serde(default)]
-    max_refresh_credits: f64,
+    max_refresh_credits: Option<f64>,
     #[serde(default)]
-    pro_monthly_credits: f64,
+    pro_monthly_credits: Option<f64>,
     #[serde(default)]
-    event_credits: f64,
+    event_credits: Option<f64>,
     #[serde(default)]
     next_refresh_time: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -99,7 +99,7 @@ impl ManusProvider {
             .await
             .map_err(|e| ProviderError::Parse(format!("Failed to parse Manus response: {e}")))?;
         let credits = parse_credits(body)?;
-        Ok(snapshot_from_credits(&credits))
+        snapshot_from_credits(&credits)
     }
 }
 
@@ -138,43 +138,51 @@ fn parse_credits(body: Value) -> Result<ManusCreditsResponse, ProviderError> {
         .map_err(|e| ProviderError::Parse(format!("Failed to parse Manus credits: {e}")))
 }
 
-fn snapshot_from_credits(credits: &ManusCreditsResponse) -> UsageSnapshot {
-    let primary = if credits.pro_monthly_credits > 0.0 {
-        let used = (credits.pro_monthly_credits - credits.periodic_credits).max(0.0);
-        let percent = used / credits.pro_monthly_credits * 100.0;
+fn snapshot_from_credits(credits: &ManusCreditsResponse) -> Result<UsageSnapshot, ProviderError> {
+    let primary = if let (Some(total), Some(remaining)) = (
+        credits.pro_monthly_credits.filter(|total| *total > 0.0),
+        credits.periodic_credits,
+    ) {
+        let used = (total - remaining).max(0.0);
+        let percent = used / total * 100.0;
         RateWindow::with_details(
             percent,
             None,
             None,
-            Some(format!(
-                "{:.0} total credits ({:.0} free)",
-                credits.total_credits, credits.free_credits
+            Some(credits.total_credits.map_or_else(
+                || format!("{remaining:.0}/{total:.0} monthly credits"),
+                |balance| {
+                    format!(
+                        "{balance:.0} total credits ({:.0} free)",
+                        credits.free_credits
+                    )
+                },
             )),
         )
+    } else if let Some(balance) = credits.total_credits {
+        RateWindow::informational(format!("{balance:.0} total credits"))
     } else {
-        RateWindow::with_details(
-            0.0,
-            None,
-            None,
-            Some(format!("{:.0} credits available", credits.total_credits)),
-        )
+        RateWindow::informational("Monthly credit usage unavailable")
     };
 
-    let mut snapshot = UsageSnapshot::new(primary).with_login_method(format!(
-        "Balance: {:.0} credits",
-        credits.total_credits.round()
-    ));
+    let mut snapshot = UsageSnapshot::new(primary);
+    if let Some(balance) = credits.total_credits {
+        snapshot = snapshot.with_login_method(format!("Balance: {:.0} credits", balance.round()));
+    }
 
-    if credits.max_refresh_credits > 0.0 {
-        let used = (credits.max_refresh_credits - credits.refresh_credits).max(0.0);
-        let mut secondary = RateWindow::with_details(
-            used / credits.max_refresh_credits * 100.0,
+    if let (Some(total), Some(remaining)) = (
+        credits.max_refresh_credits.filter(|total| *total > 0.0),
+        credits.refresh_credits,
+    ) {
+        let used = (total - remaining).max(0.0);
+        let secondary = RateWindow::with_details(
+            used / total * 100.0,
             None,
             credits.next_refresh_time,
             Some(format!(
                 "{:.0}/{:.0} refresh credits{}",
-                credits.refresh_credits,
-                credits.max_refresh_credits,
+                remaining,
+                total,
                 credits
                     .refresh_interval
                     .as_deref()
@@ -182,23 +190,27 @@ fn snapshot_from_credits(credits: &ManusCreditsResponse) -> UsageSnapshot {
                     .unwrap_or_default()
             )),
         );
-        if !secondary.used_percent.is_finite() {
-            secondary.used_percent = 0.0;
-        }
         snapshot = snapshot.with_secondary(secondary);
     }
 
-    if credits.addon_credits > 0.0 {
-        let mut addon = RateWindow::new(0.0);
-        addon.reset_description = Some(format!("{:.0} add-on credits", credits.addon_credits));
+    if let Some(balance) = credits.addon_credits {
+        let addon = RateWindow::informational(format!("{balance:.0} add-on credits"));
         snapshot = snapshot.with_extra_rate_window("addon", "Add-on credits", addon);
     }
-    if credits.event_credits > 0.0 {
-        let mut event = RateWindow::new(0.0);
-        event.reset_description = Some(format!("{:.0} event credits", credits.event_credits));
+    if let Some(balance) = credits.event_credits {
+        let event = RateWindow::informational(format!("{balance:.0} event credits"));
         snapshot = snapshot.with_extra_rate_window("event", "Event credits", event);
     }
-    snapshot
+    if snapshot.primary.is_informational
+        && snapshot.secondary.is_none()
+        && credits.total_credits.is_none()
+        && snapshot.extra_rate_windows.is_empty()
+    {
+        return Err(ProviderError::Parse(
+            "Manus response contains no usable credit quota or balance".into(),
+        ));
+    }
+    Ok(snapshot)
 }
 
 impl Default for ManusProvider {
@@ -254,5 +266,108 @@ mod tests {
             session_token("foo=bar; session_id=abc123; other=1").as_deref(),
             Some("abc123")
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    fn build(value: Value) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_credits(&parse_credits(value)?)
+    }
+    #[test]
+    fn review16_quota_less_response_preserves_all_balances() {
+        let snapshot =
+            build(json!({"totalCredits":47,"addonCredits":40,"eventCredits":7})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("47 total credits")
+        );
+        assert_eq!(
+            snapshot.login_method.as_deref(),
+            Some("Balance: 47 credits")
+        );
+        for (id, description) in [("addon", "40 add-on credits"), ("event", "7 event credits")] {
+            let window = &snapshot
+                .extra_rate_windows
+                .iter()
+                .find(|w| w.id == id)
+                .unwrap()
+                .window;
+            assert!(window.is_informational);
+            assert_eq!(window.reset_description.as_deref(), Some(description));
+        }
+    }
+
+    #[test]
+    fn review16_explicit_zero_balance_is_not_missing() {
+        let snapshot = build(json!({"totalCredits":0})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("0 total credits")
+        );
+        assert!(build(json!({})).is_err());
+    }
+
+    #[test]
+    fn review16_addon_only_does_not_invent_total_balance() {
+        let snapshot = build(json!({"addonCredits":40})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("Monthly credit usage unavailable")
+        );
+        assert!(snapshot.login_method.is_none());
+        assert_eq!(
+            snapshot.extra_rate_windows[0]
+                .window
+                .reset_description
+                .as_deref(),
+            Some("40 add-on credits")
+        );
+    }
+
+    #[test]
+    fn cx289a_missing_quota_is_error() {
+        for value in [
+            json!({}),
+            json!({"proMonthlyCredits":100}),
+            json!({"periodicCredits":100}),
+            json!({"maxRefreshCredits":100}),
+        ] {
+            assert!(build(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn cx289a_refresh_only_keeps_unknown_primary() {
+        let snap = build(json!({"maxRefreshCredits":100,"refreshCredits":100})).unwrap();
+        assert!(snap.primary.is_informational);
+        assert_eq!(snap.secondary.unwrap().used_percent, 0.0);
+    }
+    #[test]
+    fn addon_and_event_balances_are_information_not_zero_percent() {
+        let snap = build(json!({
+            "proMonthlyCredits":100,"periodicCredits":100,
+            "addonCredits":40,"eventCredits":7
+        }))
+        .unwrap();
+        for id in ["addon", "event"] {
+            let window = &snap
+                .extra_rate_windows
+                .iter()
+                .find(|w| w.id == id)
+                .unwrap_or_else(|| panic!("{id} window"))
+                .window;
+            assert!(window.is_informational, "{id}");
+        }
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        let snap = build(json!({"proMonthlyCredits":100,"periodicCredits":100})).unwrap();
+        assert!(!snap.primary.is_informational);
+        assert_eq!(snap.primary.used_percent, 0.0);
     }
 }

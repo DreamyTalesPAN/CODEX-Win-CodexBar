@@ -85,7 +85,7 @@ impl Provider for ZedProvider {
                     .json()
                     .await
                     .map_err(|e| ProviderError::Parse(format!("Failed to parse Zed usage: {e}")))?;
-                Ok(ProviderFetchResult::new(snapshot_from_user(&value), "api"))
+                Ok(ProviderFetchResult::new(snapshot_from_user(&value)?, "api"))
             }
             SourceMode::Web | SourceMode::Cli => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
@@ -98,19 +98,17 @@ impl Provider for ZedProvider {
     }
 }
 
-fn snapshot_from_user(value: &Value) -> UsageSnapshot {
+fn snapshot_from_user(value: &Value) -> Result<UsageSnapshot, ProviderError> {
     let plan = value.get("plan").unwrap_or(value);
     let usage = plan.get("usage").unwrap_or(plan);
     let edits = usage
         .pointer("/edit_predictions")
         .or_else(|| usage.pointer("/editPredictions"))
         .unwrap_or(usage);
-    let used = number(edits, &["used"]).unwrap_or(0.0);
-    let limit = number(edits, &["limit"]);
-    let percent = limit
-        .filter(|v| *v > 0.0)
-        .map_or(0.0, |limit| used / limit * 100.0);
-    UsageSnapshot::new(RateWindow::new(percent)).with_login_method("Zed")
+    let (used, limit) = number(edits, &["used"])
+        .zip(number(edits, &["limit"]).filter(|limit| *limit > 0.0))
+        .ok_or_else(|| ProviderError::Parse("Zed response contains no usable quota".into()))?;
+    Ok(UsageSnapshot::new(RateWindow::new(used / limit * 100.0)).with_login_method("Zed"))
 }
 
 fn number(value: &Value, keys: &[&str]) -> Option<f64> {
@@ -126,7 +124,35 @@ mod tests {
     fn parses_edit_predictions() {
         let snapshot = snapshot_from_user(
             &serde_json::json!({"plan":{"usage":{"editPredictions":{"used":50,"limit":200}}}}),
-        );
+        )
+        .expect("quota");
         assert_eq!(snapshot.primary.used_percent, 25.0);
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_user(&value)
+    }
+    #[test]
+    fn missing_usage_is_an_error() {
+        for value in [
+            json!({}),
+            json!({"used":0}),
+            json!({"limit":100}),
+            json!({"used":0,"limit":0}),
+        ] {
+            assert!(parse(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = parse(json!({"used":0,"limit":100})).unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

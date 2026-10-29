@@ -123,14 +123,14 @@ impl MiMoProvider {
             self.get_json("tokenPlan/detail", &cookie).await.ok();
         let usage: Option<TokenPlanUsageResponse> =
             self.get_json("tokenPlan/usage", &cookie).await.ok();
-        Ok(snapshot_from_parts(
+        snapshot_from_parts(
             balance_value,
             data.currency,
             data.cash_balance,
             data.gift_balance,
             detail,
             usage,
-        ))
+        )
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(
@@ -213,7 +213,7 @@ fn snapshot_from_parts(
     gift_balance: Option<String>,
     detail: Option<TokenPlanDetailResponse>,
     usage: Option<TokenPlanUsageResponse>,
-) -> UsageSnapshot {
+) -> Result<UsageSnapshot, ProviderError> {
     let detail_data =
         detail.and_then(|response| (response.code == 0).then_some(response.data).flatten());
     let usage_item = usage
@@ -238,15 +238,9 @@ fn snapshot_from_parts(
             Some(format!("{}/{} tokens", item.used, item.limit)),
         )
     } else {
-        RateWindow::with_details(
-            0.0,
-            RateWindow::monthly_window_minutes(period_end),
-            period_end,
-            Some("No token-plan usage".into()),
-        )
+        RateWindow::informational("MiMo plan usage unavailable")
     };
-    let mut secondary = RateWindow::new(0.0);
-    secondary.reset_description = Some(balance_description(
+    let secondary = RateWindow::informational(balance_description(
         balance,
         &currency,
         cash_balance.as_deref(),
@@ -259,7 +253,7 @@ fn snapshot_from_parts(
     } else {
         snapshot = snapshot.with_login_method(format!("{balance:.2} {currency}"));
     }
-    snapshot
+    Ok(snapshot)
 }
 
 fn parse_mimo_date(value: &str) -> Option<DateTime<Utc>> {
@@ -366,5 +360,43 @@ mod tests {
         );
         assert_eq!(primary.window_minutes, Some(28 * 24 * 60));
         assert_eq!(primary.resets_at, Some(period_end));
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(usage: Option<TokenPlanUsageResponse>) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_parts(5.0, "CNY".into(), None, None, None, usage)
+    }
+    #[test]
+    fn review16_missing_optional_plan_preserves_balance() {
+        for usage in [
+            None,
+            Some(json!({"code":0,"data":{"monthUsage":{"items":[]}}})),
+            Some(json!({"code":503})),
+        ] {
+            let snapshot =
+                parse(usage.map(|value| serde_json::from_value(value).unwrap())).unwrap();
+            assert!(snapshot.primary.is_informational);
+            assert_eq!(
+                snapshot.primary.reset_description.as_deref(),
+                Some("MiMo plan usage unavailable")
+            );
+            let balance = snapshot.secondary.unwrap();
+            assert!(balance.is_informational);
+            assert_eq!(
+                balance.reset_description.as_deref(),
+                Some("5.00 CNY balance")
+            );
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = parse(Some(serde_json::from_value(json!({"code":0,"data":{"monthUsage":{"items":[{"used":0,"limit":100,"percent":0}]}}})).unwrap())).unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
     }
 }

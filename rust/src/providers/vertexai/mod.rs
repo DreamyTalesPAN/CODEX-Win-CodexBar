@@ -184,10 +184,7 @@ impl VertexAIProvider {
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
         // Get project ID from config
-        let project_id = self
-            .get_project_id()
-            .await
-            .unwrap_or_else(|_| "unknown".to_string());
+        let project_id = self.get_project_id().await?;
 
         // Vertex AI billing/quota API
         let resp = client
@@ -197,23 +194,13 @@ impl VertexAIProvider {
             ))
             .header("Authorization", format!("Bearer {}", token))
             .send()
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let json: serde_json::Value = r
-                    .json()
-                    .await
-                    .map_err(|e| ProviderError::Parse(e.to_string()))?;
-                self.parse_usage_response(&json, &project_id)
-            }
-            _ => {
-                // Return placeholder with project info
-                let usage = UsageSnapshot::new(RateWindow::new(0.0))
-                    .with_login_method(format!("Vertex AI ({})", project_id));
-                Ok(usage)
-            }
-        }
+            .await?
+            .error_for_status()?;
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parse(e.to_string()))?;
+        self.parse_usage_response(&json, &project_id)
     }
 
     async fn get_project_id(&self) -> Result<String, ProviderError> {
@@ -257,10 +244,15 @@ impl VertexAIProvider {
         let project_name = json
             .get("name")
             .and_then(|v| v.as_str())
-            .unwrap_or(project_id);
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                ProviderError::Parse(format!("No Vertex AI project metadata for {project_id}"))
+            })?;
 
-        let usage = UsageSnapshot::new(RateWindow::new(0.0))
-            .with_login_method(format!("Vertex AI ({})", project_name));
+        let usage = UsageSnapshot::new(RateWindow::informational(
+            "Project metadata; quota unavailable",
+        ))
+        .with_login_method(format!("Vertex AI ({})", project_name));
 
         Ok(usage)
     }
@@ -281,7 +273,10 @@ impl VertexAIProvider {
                 "Vertex AI (installed)".to_string()
             };
 
-            let usage = UsageSnapshot::new(RateWindow::new(0.0)).with_login_method(&label);
+            let usage = UsageSnapshot::new(RateWindow::informational(
+                "gcloud installed; quota unavailable",
+            ))
+            .with_login_method(&label);
             Ok(usage)
         } else {
             Err(ProviderError::NotInstalled("gcloud not found".to_string()))
@@ -395,5 +390,25 @@ mod tests {
             parse_access_token_response(b"not-json"),
             Err(ProviderError::Parse(message)) if !message.is_empty()
         ));
+    }
+}
+
+#[cfg(test)]
+mod informational_tests {
+    use super::*;
+    #[test]
+    fn project_metadata_is_information() {
+        let usage = VertexAIProvider::new()
+            .parse_usage_response(&serde_json::json!({"name":"test-project"}), "test-project")
+            .unwrap();
+        assert!(usage.primary.is_informational);
+    }
+    #[test]
+    fn empty_project_response_is_an_error() {
+        assert!(
+            VertexAIProvider::new()
+                .parse_usage_response(&serde_json::json!({}), "test-project")
+                .is_err()
+        );
     }
 }

@@ -138,7 +138,6 @@ struct CostReportResponse {
 
 #[derive(Debug, Deserialize)]
 struct CostBucket {
-    starting_at: String,
     #[allow(
         dead_code,
         reason = "admin API response fields are deserialized for parsing but not all are read"
@@ -161,7 +160,6 @@ struct MessagesUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct MessageBucket {
-    starting_at: String,
     #[allow(
         dead_code,
         reason = "admin API response fields are deserialized for parsing but not all are read"
@@ -215,39 +213,19 @@ fn result_from_admin_usage(
         .map(|r| r.output_tokens.unwrap_or(0))
         .sum();
     let total_tokens = input_tokens + output_tokens;
-    let start = costs
-        .data
-        .first()
-        .and_then(|b| DateTime::parse_from_rfc3339(&b.starting_at).ok())
-        .or_else(|| {
-            messages
-                .data
-                .first()
-                .and_then(|b| DateTime::parse_from_rfc3339(&b.starting_at).ok())
-        })
-        .map(|dt| dt.with_timezone(&Utc));
-
-    let mut usage = UsageSnapshot::new(RateWindow::with_details(
-        0.0,
-        None,
-        start,
-        Some(format!("${cost_total:.2} over last 30 days")),
-    ))
-    .with_secondary(RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!("{total_tokens} tokens")),
-    ))
+    let mut usage = UsageSnapshot::new(RateWindow::informational(format!(
+        "${cost_total:.2} over last 30 days"
+    )))
+    .with_secondary(RateWindow::informational(format!("{total_tokens} tokens")))
     .with_extra_rate_window(
         "input-tokens",
         "Input tokens",
-        RateWindow::with_details(0.0, None, None, Some(format!("{input_tokens}"))),
+        RateWindow::informational(format!("{input_tokens}")),
     )
     .with_extra_rate_window(
         "output-tokens",
         "Output tokens",
-        RateWindow::with_details(0.0, None, None, Some(format!("{output_tokens}"))),
+        RateWindow::informational(format!("{output_tokens}")),
     )
     .with_login_method("Admin API");
     usage.updated_at = now;
@@ -276,7 +254,7 @@ fn result_from_admin_usage(
         usage = usage.with_extra_rate_window(
             format!("model-{idx}"),
             format!("Model: {model}"),
-            RateWindow::with_details(0.0, None, None, Some(format!("{tokens} tokens"))),
+            RateWindow::informational(format!("{tokens} tokens")),
         );
     }
 
@@ -297,7 +275,7 @@ fn result_from_admin_usage(
         usage = usage.with_extra_rate_window(
             format!("cost-{idx}"),
             format!("Cost: {item}"),
-            RateWindow::with_details(0.0, None, None, Some(format!("${cost:.2}"))),
+            RateWindow::informational(format!("${cost:.2}")),
         );
     }
 
@@ -322,5 +300,47 @@ mod tests {
             clean_key(" 'sk-ant-admin-123' "),
             Some("sk-ant-admin-123".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289b_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn admin_costs_and_tokens_without_quota_are_informational() {
+        let costs = serde_json::from_value(json!({"data":[{
+            "starting_at":"2026-10-01T00:00:00Z", "ending_at":"2026-10-02T00:00:00Z",
+            "results":[{"amount":"1250", "description":"API"}]
+        }]}))
+        .unwrap();
+        let messages = serde_json::from_value(json!({"data":[{
+            "starting_at":"2026-10-01T00:00:00Z", "ending_at":"2026-10-02T00:00:00Z",
+            "results":[{"model":"synthetic", "uncached_input_tokens":100, "output_tokens":50}]
+        }]}))
+        .unwrap();
+        let result = result_from_admin_usage(&costs, &messages, Utc::now());
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.primary.resets_at.is_none());
+        assert!(result.usage.secondary.unwrap().is_informational);
+        assert!(
+            result
+                .usage
+                .extra_rate_windows
+                .iter()
+                .all(|w| w.window.is_informational)
+        );
+        assert!(result.cost.is_some());
+    }
+    #[test]
+    fn empty_admin_reports_are_not_a_zero_quota() {
+        let result = result_from_admin_usage(
+            &CostReportResponse { data: vec![] },
+            &MessagesUsageResponse { data: vec![] },
+            Utc::now(),
+        );
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.secondary.unwrap().is_informational);
     }
 }

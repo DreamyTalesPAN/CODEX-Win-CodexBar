@@ -412,12 +412,9 @@ fn result_from_payloads(
     } else if let Some(monthly) = monthly_window {
         UsageSnapshot::new(monthly)
     } else {
-        UsageSnapshot::new(RateWindow::with_details(
-            0.0,
-            None,
-            period_end,
-            Some(format!("{monthly_credits:.2} monthly credits remaining")),
-        ))
+        UsageSnapshot::new(RateWindow::informational(format!(
+            "{monthly_credits:.2} monthly credits remaining"
+        )))
     };
 
     if let Some(method) = login_method(monthly_credits, purchased, plan) {
@@ -455,7 +452,7 @@ fn limit_window(value: Option<&Value>, window_minutes: u32) -> Option<RateWindow
     if cap <= 0.0 {
         return None;
     }
-    let used = number(limit.get("used")).unwrap_or(0.0);
+    let used = number(limit.get("used"))?;
     let used_percent = (used / cap * 100.0).clamp(0.0, 100.0);
     Some(RateWindow::with_details(
         used_percent,
@@ -490,8 +487,7 @@ fn coerce_reset_at(value: Option<&Value>) -> Option<DateTime<Utc>> {
 
 /// Monthly grant window from the plan catalog (upstream `makeMonthlyWindow`):
 /// catalog total − remaining, clamped to [0, total]. Without a recognized plan
-/// the fallback keeps a visible-but-empty bar when credits remain, and no
-/// window at all when the account holds nothing.
+/// the remaining balance is informational, not a measured usage percentage.
 fn monthly_window(
     monthly_remaining: f64,
     purchased: f64,
@@ -511,12 +507,9 @@ fn monthly_window(
         ));
     }
     if monthly_remaining > 0.0 || purchased > 0.0 {
-        return Some(RateWindow::with_details(
-            0.0,
-            RateWindow::monthly_window_minutes(period_end),
-            period_end,
-            None,
-        ));
+        return Some(RateWindow::informational(format!(
+            "{monthly_remaining:.2} monthly credits remaining · {purchased:.2} purchased credits"
+        )));
     }
     None
 }
@@ -847,5 +840,27 @@ mod tests {
         );
         assert!(result.usage.tertiary.is_none());
         assert!(result.usage.login_method.is_none());
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cx289a_cap_without_counter_is_unknown() {
+        assert!(limit_window(Some(&json!({"cap":100})), 300).is_none());
+    }
+    #[test]
+    fn cx289a_unknown_plan_balance_is_informational() {
+        let window = monthly_window(25.0, 0.0, None, None).unwrap();
+        assert!(window.is_informational);
+        assert!(window.resets_at.is_none());
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved() {
+        let window = limit_window(Some(&json!({"cap":100,"used":0})), 300).unwrap();
+        assert_eq!(window.used_percent, 0.0);
+        assert!(!window.is_informational);
     }
 }
