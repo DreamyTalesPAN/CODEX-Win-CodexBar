@@ -325,10 +325,17 @@ fn snapshot_from_response(response: CopilotUsageResponse) -> Result<UsageSnapsho
         ));
     }
 
-    let primary = primary_quota
-        .as_ref()
-        .map(|quota| quota.to_rate_window(reset))
-        .unwrap_or_else(|| RateWindow::new(0.0));
+    // A response with only extra quotas keeps them beside an informational
+    // primary; with no quota at all there is nothing to report.
+    let primary = match &primary_quota {
+        Some(quota) => quota.to_rate_window(reset),
+        None if !quotas.extra.is_empty() => RateWindow::informational("No primary quota reported"),
+        None => {
+            return Err(ProviderError::Parse(
+                "Copilot usage response contains no usable quota".to_string(),
+            ));
+        }
+    };
 
     let mut usage =
         UsageSnapshot::new(primary).with_login_method(plan_label(&response.copilot_plan));
@@ -1171,5 +1178,55 @@ mod tests {
             }"#,
         );
         assert!(err.is_err());
+    }
+}
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    fn snapshot(body: &str) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_response(serde_json::from_str(body).expect("response"))
+    }
+
+    #[test]
+    fn response_without_a_usable_quota_is_an_error_not_zero_percent() {
+        assert!(snapshot(r#"{}"#).is_err());
+        assert!(snapshot(r#"{"copilot_plan":"individual","quota_snapshots":{}}"#).is_err());
+    }
+
+    #[test]
+    fn extra_quota_without_a_primary_keeps_the_quota_and_invents_no_zero() {
+        let usage = snapshot(
+            r#"{"quota_snapshots":{"custom":{"percent_remaining":75,"quota_id":"custom"}}}"#,
+        )
+        .expect("usage");
+        assert!(usage.primary.is_informational);
+        assert_eq!(usage.extra_rate_windows.len(), 1);
+        let extra = &usage.extra_rate_windows[0].window;
+        assert!(!extra.is_informational);
+        assert!((extra.used_percent - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn extra_quota_next_to_a_primary_stays_beside_it() {
+        let usage = snapshot(
+            r#"{"quota_snapshots":{
+                "premium_interactions":{"percent_remaining":60,"quota_id":"premium_interactions"},
+                "custom":{"percent_remaining":75,"quota_id":"custom"}}}"#,
+        )
+        .expect("usage");
+        assert!(!usage.primary.is_informational);
+        assert!((usage.primary.used_percent - 40.0).abs() < 0.01);
+        assert_eq!(usage.extra_rate_windows.len(), 1);
+    }
+
+    #[test]
+    fn full_remaining_percent_stays_a_zero_percent_quota() {
+        let usage =
+            snapshot(r#"{"quota_snapshots":{"chat":{"percent_remaining":100,"quota_id":"chat"}}}"#)
+                .expect("usage");
+        assert_eq!(usage.primary.used_percent, 0.0);
+        assert!(!usage.primary.is_informational);
     }
 }

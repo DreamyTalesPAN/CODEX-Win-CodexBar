@@ -29,6 +29,13 @@ const EXTERNAL_OAUTH_REFRESH_WINDOW: chrono::TimeDelta = chrono::Duration::minut
 
 static CREDENTIAL_CACHE: OnceLock<Mutex<Option<CachedCodexCredentials>>> = OnceLock::new();
 
+type RateLimitWindows = (
+    RateWindow,
+    Option<RateWindow>,
+    Option<RateWindow>,
+    Option<RateWindow>,
+);
+
 /// Codex API client
 pub struct CodexApi {
     client: reqwest::Client,
@@ -528,7 +535,7 @@ impl CodexApi {
             .map(|s| s.to_string());
 
         // Extract rate limit info - handle multiple possible structures
-        let (primary, secondary, monthly, code_review) = self.extract_rate_limits(json);
+        let (primary, secondary, monthly, code_review) = self.extract_rate_limits(json)?;
 
         // Build login method string
         let login_method = plan_type.as_deref().map(format_plan_type);
@@ -561,12 +568,7 @@ impl CodexApi {
     fn extract_rate_limits(
         &self,
         json: &serde_json::Value,
-    ) -> (
-        RateWindow,
-        Option<RateWindow>,
-        Option<RateWindow>,
-        Option<RateWindow>,
-    ) {
+    ) -> Result<RateLimitWindows, ProviderError> {
         // Try rate_limit object
         if let Some(rate_limit) = json.get("rate_limit") {
             let primary_opt = rate_limit
@@ -585,7 +587,7 @@ impl CodexApi {
 
             // F5 (upstream 0.48.0): named windows carry only session/weekly/code_review.
             // Monthly is extracted separately (from array windows) — return None here.
-            return (primary, secondary, None, code_review);
+            return Ok((primary, secondary, None, code_review));
         }
 
         // Try rate_limits array
@@ -606,12 +608,12 @@ impl CodexApi {
             if let Some(cr) = code_review {
                 usage = usage.with_model_specific(cr);
             }
-            return (
+            return Ok((
                 usage.primary,
                 usage.secondary,
                 usage.tertiary,
                 usage.model_specific,
-            );
+            ));
         }
 
         // Try direct fields
@@ -619,9 +621,11 @@ impl CodexApi {
             .get("used_percent")
             .or_else(|| json.get("usage_percent"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .ok_or_else(|| {
+                ProviderError::Parse("Codex usage response has no usage fields".to_string())
+            })?;
 
-        (RateWindow::new(used_percent), None, None, None)
+        Ok((RateWindow::new(used_percent), None, None, None))
     }
 
     fn parse_window(&self, window: &serde_json::Value) -> RateWindow {
@@ -1180,18 +1184,13 @@ fn json_i64(value: &serde_json::Value) -> Option<i64> {
 }
 
 fn is_placeholder_window(window: &serde_json::Value) -> bool {
-    let has_usage = window
+    // Without a used percentage the window carries no reading; do not
+    // invent a 0% quota from a window that only has a duration or reset.
+    window
         .get("used_percent")
         .or_else(|| window.get("usage_percent"))
         .and_then(json_f64)
-        .is_some();
-    let has_duration = window
-        .get("limit_window_seconds")
-        .and_then(json_i64)
-        .is_some();
-    let has_reset = window.get("reset_at").and_then(json_i64).is_some();
-
-    !has_usage && !has_duration && !has_reset
+        .is_none()
 }
 
 fn slugify(label: &str) -> String {
@@ -2037,5 +2036,49 @@ mod tests {
         assert!(parse_timestamp("  2026-08-17T10:00:00Z  ").is_some());
         assert!(parse_timestamp("").is_none());
         assert!(parse_timestamp("not-a-date").is_none());
+    }
+}
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn body_without_usage_fields_is_an_error_not_zero_percent() {
+        assert!(CodexApi::new().build_result_from_json(&json!({})).is_err());
+        assert!(
+            CodexApi::new()
+                .build_result_from_json(&json!({"plan_type": "plus"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn window_with_only_a_duration_is_not_a_zero_percent_quota() {
+        let (usage, _) = CodexApi::new()
+            .build_result_from_json(&json!({
+                "rate_limit": {"primary_window": {"limit_window_seconds": 18000}}
+            }))
+            .expect("codex usage");
+
+        assert!(usage.primary.is_informational);
+    }
+
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let (direct, _) = CodexApi::new()
+            .build_result_from_json(&json!({"used_percent": 0}))
+            .expect("direct field");
+        assert!(!direct.primary.is_informational);
+        assert_eq!(direct.primary.used_percent, 0.0);
+
+        let (named, _) = CodexApi::new()
+            .build_result_from_json(&json!({
+                "rate_limit": {"primary_window": {"used_percent": 0, "limit_window_seconds": 18000}}
+            }))
+            .expect("named window");
+        assert!(!named.primary.is_informational);
+        assert_eq!(named.primary.used_percent, 0.0);
     }
 }

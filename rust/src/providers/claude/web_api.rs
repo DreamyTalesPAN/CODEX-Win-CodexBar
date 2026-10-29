@@ -161,6 +161,11 @@ impl<'de> Deserialize<'de> for UsageResponse {
                     }
                     let window: UsageWindow =
                         serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                    // A window without utilization carries no reading; treat it
+                    // as absent instead of reporting a 0% quota.
+                    if window.utilization.is_none() {
+                        continue;
+                    }
                     return Ok(Some(window));
                 }
             }
@@ -1299,3 +1304,32 @@ mod tests {
 #[cfg(test)]
 #[path = "cloudflare_tests.rs"]
 mod cloudflare_tests;
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    fn windows(body: &str) -> (RateWindow, Option<RateWindow>, Option<RateWindow>) {
+        let usage: UsageResponse = serde_json::from_str(body).expect("usage body");
+        ClaudeWebApiFetcher::new().build_rate_windows(&usage)
+    }
+
+    #[test]
+    fn window_without_utilization_is_not_a_zero_percent_quota() {
+        let (primary, secondary, _) = windows(r#"{"five_hour":{},"seven_day":{"resets_at":null}}"#);
+
+        assert!(primary.is_informational);
+        assert!(secondary.is_none());
+    }
+
+    #[test]
+    fn real_zero_utilization_stays_a_quota() {
+        let (primary, secondary, _) = windows(
+            r#"{"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":0}}"#,
+        );
+
+        assert!(!primary.is_informational);
+        assert_eq!(primary.used_percent, 0.0);
+        assert_eq!(secondary.expect("weekly").used_percent, 0.0);
+    }
+}
