@@ -97,7 +97,7 @@ impl Provider for DevinProvider {
                 let value: Value = response.json().await.map_err(|e| {
                     ProviderError::Parse(format!("Failed to parse Devin quota: {e}"))
                 })?;
-                Ok(fetch_result_from_quota(&value, &org))
+                fetch_result_from_quota(&value, &org)
             }
             SourceMode::Web | SourceMode::Cli => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
@@ -145,23 +145,32 @@ fn normalized_org(raw: &str) -> String {
     }
 }
 
-fn snapshot_from_quota(value: &Value, org: &str) -> UsageSnapshot {
+fn snapshot_from_quota(value: &Value, org: &str) -> Result<UsageSnapshot, ProviderError> {
     let daily = percent(value, &["daily_percentage", "dailyPercentage"])
-        .unwrap_or_else(|| percent(value, &["used_percent", "usedPercent"]).unwrap_or(0.0));
-    let mut snapshot =
-        UsageSnapshot::new(RateWindow::new(daily)).with_organization(org.to_string());
-    if let Some(weekly) = percent(value, &["weekly_percentage", "weeklyPercentage"]) {
+        .or_else(|| percent(value, &["used_percent", "usedPercent"]))
+        .or_else(|| generic_percent(value));
+    let weekly = percent(value, &["weekly_percentage", "weeklyPercentage"]);
+    if daily.is_none() && weekly.is_none() && extra_usage_balance(value).is_none() {
+        return Err(ProviderError::Parse(
+            "Devin response contains no usable quota".into(),
+        ));
+    }
+    let primary = daily
+        .map(RateWindow::new)
+        .unwrap_or_else(|| RateWindow::informational("Daily usage unavailable"));
+    let mut snapshot = UsageSnapshot::new(primary).with_organization(org.to_string());
+    if let Some(weekly) = weekly {
         snapshot = snapshot.with_secondary(RateWindow::new(weekly));
     }
-    snapshot
+    Ok(snapshot)
 }
 
-fn fetch_result_from_quota(value: &Value, org: &str) -> ProviderFetchResult {
-    let mut result = ProviderFetchResult::new(snapshot_from_quota(value, org), "api");
+fn fetch_result_from_quota(value: &Value, org: &str) -> Result<ProviderFetchResult, ProviderError> {
+    let mut result = ProviderFetchResult::new(snapshot_from_quota(value, org)?, "api");
     if let Some(balance) = extra_usage_balance(value) {
         result = result.with_cost(CostSnapshot::new(balance, "USD", "Extra usage balance"));
     }
-    result
+    Ok(result)
 }
 
 fn percent(value: &Value, keys: &[&str]) -> Option<f64> {
@@ -170,6 +179,10 @@ fn percent(value: &Value, keys: &[&str]) -> Option<f64> {
             return Some(if v < 1.0 { v * 100.0 } else { v });
         }
     }
+    None
+}
+
+fn generic_percent(value: &Value) -> Option<f64> {
     let used = ["used", "usage", "used_count", "usedCount", "consumed"]
         .iter()
         .find_map(|k| value.get(*k).and_then(Value::as_f64));
@@ -208,14 +221,14 @@ mod tests {
     #[test]
     fn parses_fraction_percent() {
         let snapshot =
-            snapshot_from_quota(&serde_json::json!({"daily_percentage":0.25}), "org/demo");
+            snapshot_from_quota(&serde_json::json!({"daily_percentage":0.25}), "org/demo").unwrap();
         assert_eq!(snapshot.primary.used_percent, 25.0);
     }
 
     #[test]
     fn parses_exact_one_as_one_percent() {
         let snapshot =
-            snapshot_from_quota(&serde_json::json!({"daily_percentage":1.0}), "org/demo");
+            snapshot_from_quota(&serde_json::json!({"daily_percentage":1.0}), "org/demo").unwrap();
         assert_eq!(snapshot.primary.used_percent, 1.0);
     }
 
@@ -224,7 +237,8 @@ mod tests {
         let result = fetch_result_from_quota(
             &serde_json::json!({"daily_percentage": 0.2, "overage_balance": 12.34}),
             "org/demo",
-        );
+        )
+        .unwrap();
 
         let cost = result.cost.unwrap();
         assert_eq!(cost.used, 12.34);
@@ -236,7 +250,8 @@ mod tests {
         let result = fetch_result_from_quota(
             &serde_json::json!({"daily_percentage": 0.2, "overage_balance_cents": 7087}),
             "org/demo",
-        );
+        )
+        .unwrap();
 
         assert_eq!(result.cost.unwrap().used, 70.87);
     }
@@ -276,5 +291,67 @@ mod tests {
     fn ignores_organization_detail_on_non_authorization_responses() {
         let body = br#"{"detail":"No organizations found for auth1 user"}"#;
         assert!(auth_response_error(reqwest::StatusCode::NOT_FOUND, body).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    fn build(value: Value) -> Result<UsageSnapshot, ProviderError> {
+        snapshot_from_quota(&value, "org/synthetic")
+    }
+    #[test]
+    fn cx289a_missing_quota_is_error() {
+        for value in [json!({}), json!({"limit":100}), json!({"used":0})] {
+            assert!(build(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn cx289a_weekly_only_keeps_unknown_primary() {
+        let snap = build(json!({"weekly_percentage":25})).unwrap();
+        assert!(snap.primary.is_informational);
+        assert_eq!(snap.secondary.unwrap().used_percent, 25.0);
+    }
+    #[test]
+    fn cx289a_real_zero_is_quota() {
+        for value in [json!({"used":0,"limit":100}), json!({"daily_percentage":0})] {
+            let snap = build(value).unwrap();
+            assert!(!snap.primary.is_informational);
+            assert_eq!(snap.primary.used_percent, 0.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod p1_02_balance_without_quota_survives_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_02_balance_without_quota_survives() {
+        for (value, amount) in [
+            (serde_json::json!({"overage_balance":12.34}), 12.34),
+            (serde_json::json!({"overage_balance_cents":7087}), 70.87),
+        ] {
+            let result = fetch_result_from_quota(&value, "org/demo").unwrap();
+            assert!(result.usage.primary.is_informational);
+            assert!(result.usage.secondary.is_none());
+            assert_eq!(result.cost.unwrap().used, amount);
+        }
+    }
+}
+
+#[cfg(test)]
+mod p1_12_generic_counter_has_no_weekly_duplicate_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_12_generic_counter_has_no_weekly_duplicate() {
+        for used in [0, 25] {
+            let snapshot =
+                snapshot_from_quota(&serde_json::json!({"used":used,"limit":100}), "org/demo")
+                    .unwrap();
+            assert_eq!(snapshot.primary.used_percent, f64::from(used));
+            assert!(!snapshot.primary.is_informational);
+            assert!(snapshot.secondary.is_none());
+        }
     }
 }

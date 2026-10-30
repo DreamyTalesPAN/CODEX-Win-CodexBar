@@ -522,11 +522,42 @@ fn claude_probe_launch_args(session_id: &str) -> Vec<String> {
         "user".to_string(),
         "--allowed-tools".to_string(),
         String::new(),
+        // `tui: default` keeps the probe on the classic renderer, whose output
+        // the /usage parser reads, and stops Claude Code from offering the
+        // fullscreen renderer in a dialog the probe cannot answer. Flag
+        // settings apply to this launch only; the user's config is untouched.
         "--settings".to_string(),
-        r#"{"remoteControlAtStartup":false}"#.to_string(),
+        CLAUDE_PROBE_SETTINGS.to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
     ]
+}
+
+const CLAUDE_PROBE_SETTINGS: &str = r#"{"remoteControlAtStartup":false,"tui":"default"}"#;
+
+/// Titles of Claude Code startup dialogs that wait for an answer before the
+/// prompt accepts input. While one is open, the typed /usage goes nowhere.
+const CLAUDE_STARTUP_DIALOG_TITLES: &[&str] = &[
+    "Claude in Chrome extension detected",
+    "Try the new fullscreen renderer?",
+];
+
+/// Returns the title of a startup dialog that is still waiting in the probe
+/// output. Whitespace is ignored because ConPTY output can drop or move it.
+fn claude_startup_dialog_title(clean: &str) -> Option<&'static str> {
+    let squashed: String = clean
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    CLAUDE_STARTUP_DIALOG_TITLES.iter().copied().find(|title| {
+        let needle: String = title
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        squashed.contains(&needle)
+    })
 }
 
 struct ClaudePtyProbeOptions {
@@ -588,6 +619,7 @@ async fn run_claude_usage_pty_probe(
 async fn run_claude_trust_preflight(
     claude_path: std::path::PathBuf,
     working_directory: std::path::PathBuf,
+    answer_keys: &'static str,
 ) -> Result<String, ProviderError> {
     run_claude_pty_probe(
         claude_path,
@@ -599,7 +631,7 @@ async fn run_claude_trust_preflight(
             initial_delay_secs: 0.6,
             script_char_delay_secs: 0.0,
             script_line_delay_secs: 0.0,
-            send_on_substring: Some(("Enter", "\n/exit\n")),
+            send_on_substring: Some(("Enter", answer_keys)),
             script_retry_delays_secs: &[],
             script_done_substrings: &[],
             script_echo_substrings: &[],
@@ -646,8 +678,32 @@ async fn rerun_claude_usage_after_trust_prompt(
         return Ok(combined);
     }
 
-    run_claude_trust_preflight(claude_path.clone(), probe_dir.clone()).await?;
+    let answer_keys = claude_trust_prompt_answer_keys(&strip_ansi(&combined).to_lowercase());
+    let preflight =
+        run_claude_trust_preflight(claude_path.clone(), probe_dir.clone(), answer_keys).await?;
+    tracing::trace!(output = %strip_ansi(&preflight), "Claude trust preflight output");
     run_claude_usage_pty_probe(claude_path, probe_dir).await
+}
+
+/// Enter, then /exit once the folder is trusted.
+const CLAUDE_TRUST_ACCEPT_FIRST_OPTION: &str = "\r/exit\r";
+/// How long the trust dialog must be visible before the preflight answers.
+const CLAUDE_DIALOG_ANSWER_DELAY_SECS: f64 = 1.0;
+/// Arrow down to the second option, Enter, then /exit.
+const CLAUDE_TRUST_ACCEPT_SECOND_OPTION: &str = "\x1b[B\r/exit\r";
+
+/// Keys that pick "Yes, I trust this folder" in the trust dialog shown by the
+/// first probe. The dialog focuses its first option, and since Claude Code
+/// 2.1.29x that option is "No, exit": a plain Enter quits without saving the
+/// trust, so the dialog came back on every probe.
+fn claude_trust_prompt_answer_keys(lowered: &str) -> &'static str {
+    match (
+        lowered.find("no, exit"),
+        lowered.find("yes, i trust this folder"),
+    ) {
+        (Some(no), Some(yes)) if no < yes => CLAUDE_TRUST_ACCEPT_SECOND_OPTION,
+        _ => CLAUDE_TRUST_ACCEPT_FIRST_OPTION,
+    }
 }
 
 fn claude_cli_error_from_output(output: &str) -> Option<ProviderError> {
@@ -710,6 +766,9 @@ fn claude_passive_probe_env(
     // Passive status/usage probes must not mutate or update the user's Claude CLI installation.
     base.insert("NO_COLOR".to_string(), "1".to_string());
     base.insert("DISABLE_AUTOUPDATER".to_string(), "1".to_string());
+    // Without this, Claude Code offers Claude in Chrome at startup whenever
+    // the extension is installed, and that dialog swallows the typed /usage.
+    base.insert("CLAUDE_CODE_ENABLE_CFC".to_string(), "0".to_string());
     base
 }
 
@@ -741,7 +800,12 @@ async fn run_claude_pty_probe(
             options = options.with_idle_timeout_after_done(idle);
         }
         if let Some((trigger, keys)) = probe.send_on_substring {
-            options = options.with_send_on_substring(trigger, keys);
+            // Claude Code ignores keys that reach a dialog within 150-500 ms
+            // of it opening and resets the dialog's focus, so answer only
+            // once the dialog has been on screen for a moment.
+            options = options
+                .with_send_on_substring(trigger, keys)
+                .with_send_trigger_delay(CLAUDE_DIALOG_ANSWER_DELAY_SECS);
         }
         if !probe.script_retry_delays_secs.is_empty() {
             options = options.with_script_retries(
@@ -788,6 +852,7 @@ fn last_good_failure_policy_for_error(error: &str) -> LastGoodFailurePolicy {
         || lower.contains("empty output")
         || lower.contains("missing current session")
         || lower.contains("treated /usage as a normal prompt")
+        || lower.contains("stopped at a startup question")
         || lower.contains("local activity stats")
         || lower.contains("could not parse")
         || lower.contains("rate limit")
@@ -903,10 +968,12 @@ impl ClaudeProvider {
             return Ok(result);
         }
 
-        if let Some(result) =
-            record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
-        {
-            return Ok(result);
+        // A session key in the environment is the sign-in of VibeTV's own
+        // Claude window (#273). It names the account the customer chose, so a
+        // signed-in Claude Code (another account) must not answer instead, and
+        // an expired window sign-in stays an error rather than falling back.
+        if ClaudeWebApiFetcher::resolve_session_key_from_env().is_some() {
+            return self.fetch_via_web(ctx).await;
         }
 
         // Upstream 0.50.1 #2516: track whether OAuth failed with a revocation.
@@ -927,6 +994,23 @@ impl ClaudeProvider {
             ));
         }
 
+        // The browser can be signed in to another claude.ai account than
+        // Claude Code (a second account in another browser), and its numbers
+        // then belong to that account. So while Claude Code is signed in, its
+        // login and its /usage screen answer first and the browser is only
+        // the last live source. Without a Claude Code login the CLI cannot
+        // answer either, so the browser keeps its place before it.
+        let claude_code_signed_in = oauth_rate_limited
+            || oauth_revoked
+            || ctx.api_key.as_deref().is_some_and(|t| !t.trim().is_empty())
+            || oauth::has_stored_credentials();
+        if !claude_code_signed_in
+            && let Some(result) =
+                record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
+        {
+            return Ok(result);
+        }
+
         // When OAuth was revoked (not just expired), reuse a cached CLI result
         // if still within the 15-minute TTL to avoid re-probing the CLI.
         if oauth_revoked && let Some(cached) = cached_cli_result_for_auto() {
@@ -939,37 +1023,46 @@ impl ClaudeProvider {
         // it. Probe the CLI once and reuse that result for the cache TTL: its
         // /usage screen still shows session and weekly, so a first run with
         // nothing to preserve gets values instead of an error. After a failed
-        // probe, fail fast for a while: the rate-limit error keeps the last
+        // probe, skip it for a while: the rate-limit error keeps the last
         // good values on screen (LastGoodFailurePolicy::Preserve).
-        if oauth_rate_limited {
+        let skip_cli_probe = if oauth_rate_limited {
             if let Some(cached) = cached_cli_result_for_auto() {
                 return Ok(cached);
             }
-            if rate_limited_cli_probe_failed_recently() {
-                return Err(claude_auto_fetch_error(failures));
+            rate_limited_cli_probe_failed_recently()
+        } else {
+            false
+        };
+
+        if !skip_cli_probe {
+            let cli_result = self.fetch_via_cli(ctx).await;
+            if oauth_rate_limited {
+                note_rate_limited_cli_probe(cli_result.is_ok());
+            }
+            if let Some(mut result) = record_auto_source(&mut failures, "CLI", cli_result) {
+                // Without consent for reading Claude Code credentials, label the
+                // CLI fallback as reduced fidelity.
+                if !claude_code_consent() {
+                    result.source_label = "cli (reduced fidelity)".to_string();
+                }
+                // Cache the CLI result when OAuth was revoked or rate limited so polls
+                // within the TTL reuse it without re-probing.
+                if oauth_revoked || oauth_rate_limited {
+                    cache_cli_result(result.clone());
+                }
+                return Ok(steady_across_source_change(
+                    result,
+                    AUTO_SOURCE_CLI,
+                    Instant::now(),
+                ));
             }
         }
 
-        let cli_result = self.fetch_via_cli(ctx).await;
-        if oauth_rate_limited {
-            note_rate_limited_cli_probe(cli_result.is_ok());
-        }
-        if let Some(mut result) = record_auto_source(&mut failures, "CLI", cli_result) {
-            // Without consent for reading Claude Code credentials, label the
-            // CLI fallback as reduced fidelity.
-            if !claude_code_consent() {
-                result.source_label = "cli (reduced fidelity)".to_string();
-            }
-            // Cache the CLI result when OAuth was revoked or rate limited so polls
-            // within the TTL reuse it without re-probing.
-            if oauth_revoked || oauth_rate_limited {
-                cache_cli_result(result.clone());
-            }
-            return Ok(steady_across_source_change(
-                result,
-                AUTO_SOURCE_CLI,
-                Instant::now(),
-            ));
+        if claude_code_signed_in
+            && let Some(result) =
+                record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
+        {
+            return Ok(result);
         }
 
         // Upstream 0.50.1 #2516: when all live sources fail, keep the
@@ -1073,6 +1166,15 @@ impl ClaudeProvider {
             return Err(ProviderError::Other(
                 "Claude CLI treated /usage as a normal prompt instead of opening the interactive usage screen. Use Auto, OAuth, or Web mode for Claude usage.".to_string(),
             ));
+        }
+
+        if !clean_lower.contains("current session")
+            && !clean_lower.contains("current week")
+            && let Some(title) = claude_startup_dialog_title(&clean)
+        {
+            return Err(ProviderError::Other(format!(
+                "Claude CLI stopped at a startup question (\"{title}\") before /usage opened. Open Claude Code once in a terminal, answer the question, then refresh."
+            )));
         }
 
         // Parse session percent: "X% used" or "X% left"
@@ -1238,6 +1340,7 @@ fn should_fallback_from_claude_cli_error(error: &ProviderError) -> bool {
         ProviderError::Other(message) => {
             message.contains("returned local activity stats")
                 || message.contains("treated /usage as a normal prompt")
+                || message.contains("stopped at a startup question")
         }
         _ => false,
     }
@@ -1374,7 +1477,10 @@ fn strip_ansi(text: &str) -> String {
                     }
                 }
                 match final_char {
-                    Some('C') => result.push(' '),
+                    // Claude Code skips the blanks between words with a
+                    // cursor-forward or an absolute column jump; both stand
+                    // for whitespace on screen.
+                    Some('C') | Some('G') => result.push(' '),
                     // ConPTY places each screen row with an absolute cursor
                     // position instead of a line break. Without the break the
                     // /usage rows run together and every label reads the
@@ -1610,6 +1716,49 @@ mod tests {
             Some("1")
         );
         assert_eq!(env.get("NO_COLOR").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("CLAUDE_CODE_ENABLE_CFC").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn startup_dialog_is_reported_by_name_instead_of_missing_usage() {
+        // Claude Code 2.1.293 fullscreen offer as the probe saw it: the typed
+        // /usage landed in the dialog and never reached the prompt.
+        let output = "\u{1b}[1mTry the new fullscreen renderer?\u{1b}[0m\r\n\
+            · Flicker-free output\r\n\
+            · Mouse support — click to move your cursor or expand results\r\n\
+            ❯ Yes, try it\r\n  Not now\r\n";
+        let err = ClaudeProvider::new().parse_cli_output(output).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("stopped at a startup question"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Try the new fullscreen renderer?"),
+            "{message}"
+        );
+        assert!(should_fallback_from_claude_cli_error(&err));
+    }
+
+    #[test]
+    fn startup_dialog_title_survives_squashed_conpty_spacing() {
+        assert_eq!(
+            claude_startup_dialog_title("ClaudeinChromeextension  detected\nYes, use my browser"),
+            Some("Claude in Chrome extension detected")
+        );
+        assert_eq!(claude_startup_dialog_title("Current session 2% used"), None);
+    }
+
+    #[test]
+    fn usage_screen_wins_over_a_leftover_dialog_title() {
+        let output = "Try the new fullscreen renderer?\n\
+            Current session\n██ 2% used\nResets 3pm (Europe/Berlin)\n\
+            Current week (all models)\n████ 82% used\nResets Oct 12 (Europe/Berlin)\n";
+        let result = ClaudeProvider::new().parse_cli_output(output).unwrap();
+        assert_eq!(result.usage.primary.used_percent, 2.0);
     }
 
     #[test]
@@ -1628,7 +1777,7 @@ mod tests {
                 "--allowed-tools".to_string(),
                 String::new(),
                 "--settings".to_string(),
-                r#"{"remoteControlAtStartup":false}"#.to_string(),
+                r#"{"remoteControlAtStartup":false,"tui":"default"}"#.to_string(),
                 "--session-id".to_string(),
                 first,
             ]
@@ -2013,6 +2162,35 @@ Resets Dec 24 at 3:59pm (Europe/Paris)
             ("OAuth", ProviderError::OAuth("token expired".to_string())),
         ]);
         assert!(!err.to_string().contains(CLAUDE_BROWSER_SIGN_IN_MARKER));
+    }
+
+    #[test]
+    fn trust_prompt_answer_moves_past_a_focused_no_exit_option() {
+        // Claude Code 2.1.293 trust dialog as the probe captured it.
+        let screen = "Accessing workspace:\r\n\
+            C:\\Users\\x\\AppData\\Local\\CodexBar\\claude-usage-probe\r\n\
+            Quick safety check: Is this a project you created or one you trust?\r\n\
+            Security guide\r\n\
+            \u{1b}[2G❯\u{1b}[4GNo,\u{1b}[8Gexit\r\n\
+            \u{1b}[4GYes,\u{1b}[9GI\u{1b}[11Gtrust\u{1b}[17Gthis\u{1b}[22Gfolder\r\n\
+            Enter to confirm · Esc to cancel\r\n";
+        let lowered = strip_ansi(screen).to_lowercase();
+        assert!(is_workspace_trust_prompt(&lowered), "{lowered}");
+        assert_eq!(
+            claude_trust_prompt_answer_keys(&lowered),
+            CLAUDE_TRUST_ACCEPT_SECOND_OPTION
+        );
+    }
+
+    #[test]
+    fn trust_prompt_answer_keeps_enter_when_yes_is_listed_first() {
+        let lowered = "quick safety check: is this a project you trust?\n\
+            ❯ 1. yes, i trust this folder\n  2. no, exit\n\
+            enter to confirm · esc to cancel";
+        assert_eq!(
+            claude_trust_prompt_answer_keys(lowered),
+            CLAUDE_TRUST_ACCEPT_FIRST_OPTION
+        );
     }
 
     #[test]

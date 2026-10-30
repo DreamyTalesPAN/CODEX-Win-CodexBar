@@ -79,9 +79,12 @@ pub struct NamedRateWindow {
     pub id: String,
     pub title: String,
     pub window: RateWindow,
-    /// Whether the provider explicitly reported usage for this lane.
-    /// In-memory presentation metadata only; external snapshot JSON stays stable.
-    #[serde(default = "named_rate_window_usage_known_default", skip_serializing)]
+    /// Whether the provider explicitly reported usage for this lane. Exported
+    /// so consumers can tell an unknown lane from a real 0 %.
+    #[serde(
+        default = "named_rate_window_usage_known_default",
+        rename = "usageKnown"
+    )]
     pub usage_known: bool,
 }
 

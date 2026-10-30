@@ -241,7 +241,9 @@ fn model_window_id(config: &ModelConfig) -> String {
 }
 
 fn rate_window_from_quota(quota: &QuotaInfo) -> RateWindow {
-    let remaining = quota.remaining_fraction.unwrap_or(1.0);
+    let Some(remaining) = quota.remaining_fraction else {
+        return RateWindow::informational("Antigravity model usage unavailable");
+    };
     let used_percent = (1.0 - remaining) * 100.0;
     RateWindow::with_details(used_percent, None, None, quota.reset_time.clone())
 }
@@ -311,6 +313,17 @@ pub(super) fn parse_user_status(
         .filter(|config| !model_label(config).is_empty())
         .collect::<Vec<_>>();
     quota_configs.sort_by(|a, b| compare_model_configs(a, b));
+    if !quota_configs.iter().any(|config| {
+        config
+            .quota_info
+            .as_ref()
+            .and_then(|quota| quota.remaining_fraction)
+            .is_some()
+    }) {
+        return Err(ProviderError::Parse(
+            "Antigravity status contains no model quota".into(),
+        ));
+    }
 
     let summary_candidates = quota_configs
         .iter()
@@ -334,7 +347,8 @@ pub(super) fn parse_user_status(
         .and_then(|config| config.quota_info.as_ref())
         .map(rate_window_from_quota);
 
-    let primary = primary.unwrap_or_else(|| RateWindow::new(0.0));
+    let primary = primary
+        .ok_or_else(|| ProviderError::Parse("Antigravity status contains no model quota".into()))?;
     let mut snapshot = UsageSnapshot::new(primary);
 
     if let Some(sec) = secondary {
@@ -384,4 +398,36 @@ pub(super) fn parse_user_status(
     }
 
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod cx289a_tests {
+    use super::*;
+    use serde_json::json;
+    fn parse(models: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
+        parse_user_status(
+            serde_json::from_value(
+                json!({"userStatus":{"cascadeModelConfigData":{"clientModelConfigs":models}}}),
+            )
+            .unwrap(),
+        )
+    }
+    #[test]
+    fn cx289a_missing_model_usage_is_rejected() {
+        assert!(parse(json!([])).is_err());
+        assert!(parse(json!([{"label":"Claude","quotaInfo":{}}])).is_err());
+    }
+    #[test]
+    fn cx289a_real_zero_is_preserved_with_informational_extra() {
+        let snapshot = parse(json!([
+            {"label":"Claude","quotaInfo":{"remainingFraction":1.0}},
+            {"label":"Other","quotaInfo":{}}
+        ]))
+        .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(snapshot.extra_rate_windows.len(), 1);
+        assert!(snapshot.extra_rate_windows[0].window.is_informational);
+        assert!(!snapshot.extra_rate_windows[0].usage_known);
+    }
 }

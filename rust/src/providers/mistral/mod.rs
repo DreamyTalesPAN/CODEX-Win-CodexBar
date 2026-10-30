@@ -316,7 +316,7 @@ impl MistralProvider {
             "No usage this month".to_string()
         };
 
-        let primary = RateWindow::with_details(0.0, None, reset_date, Some(cost_description));
+        let primary = RateWindow::informational(cost_description);
         let mut usage = UsageSnapshot::new(primary);
         if summary.model_count > 0 {
             usage = usage.with_login_method(format!("{} model(s)", summary.model_count));
@@ -587,5 +587,29 @@ mod tests {
             MistralProvider::summarize_billing(billing),
             Err(ProviderError::Parse(message)) if message.contains("token count")
         ));
+    }
+}
+
+#[cfg(test)]
+mod section_b_tests {
+    use super::*;
+
+    #[test]
+    fn monthly_cost_and_tokens_are_informational() {
+        let billing = serde_json::from_str(r#"{"end_date":"2026-10-31T00:00:00Z","prices":[{"billing_metric":"m","billing_group":"input","price":"0.5"}],"completion":{"models":{"m":{"input":[{"billing_metric":"m","billing_group":"input","value":4}]}}}}"#).unwrap();
+        let result =
+            MistralProvider::build_result(MistralProvider::summarize_billing(billing).unwrap());
+        assert!(result.usage.primary.is_informational);
+        assert!(result.usage.primary.resets_at.is_none());
+        assert_eq!(result.cost.as_ref().unwrap().used, 2.0);
+        assert!(result.cost.unwrap().resets_at.is_some());
+    }
+
+    #[test]
+    fn absent_billing_does_not_create_zero_quota() {
+        let result = MistralProvider::build_result(
+            MistralProvider::summarize_billing(serde_json::from_str("{}").unwrap()).unwrap(),
+        );
+        assert!(result.usage.primary.is_informational);
     }
 }

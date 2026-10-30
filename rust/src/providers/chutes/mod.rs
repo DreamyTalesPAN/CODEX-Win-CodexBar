@@ -82,7 +82,10 @@ impl Provider for ChutesProvider {
                 let value: Value = response.json().await.map_err(|e| {
                     ProviderError::Parse(format!("Failed to parse Chutes usage: {e}"))
                 })?;
-                Ok(ProviderFetchResult::new(snapshot_from_usage(&value), "api"))
+                Ok(ProviderFetchResult::new(
+                    snapshot_from_usage(&value)?,
+                    "api",
+                ))
             }
             SourceMode::Web | SourceMode::Cli => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
@@ -95,17 +98,16 @@ impl Provider for ChutesProvider {
     }
 }
 
-fn snapshot_from_usage(value: &Value) -> UsageSnapshot {
+fn snapshot_from_usage(value: &Value) -> Result<UsageSnapshot, ProviderError> {
     let windows = quota_windows(value);
-    let primary = windows
-        .first()
-        .cloned()
-        .unwrap_or_else(|| RateWindow::new(0.0));
+    let primary = windows.first().cloned().ok_or_else(|| {
+        ProviderError::Parse("Chutes usage response contains no quota".to_string())
+    })?;
     let mut snapshot = UsageSnapshot::new(primary);
     if let Some(second) = windows.get(1).cloned() {
         snapshot = snapshot.with_secondary(second);
     }
-    snapshot.with_login_method("Chutes API")
+    Ok(snapshot.with_login_method("Chutes API"))
 }
 
 fn quota_windows(value: &Value) -> Vec<RateWindow> {
@@ -313,7 +315,8 @@ mod tests {
     #[test]
     fn parses_ratio_window() {
         let snapshot =
-            snapshot_from_usage(&serde_json::json!({"quotas":[{"used":25,"limit":100}]}));
+            snapshot_from_usage(&serde_json::json!({"quotas":[{"used":25,"limit":100}]}))
+                .expect("snapshot");
         assert_eq!(snapshot.primary.used_percent, 25.0);
     }
 
@@ -326,7 +329,8 @@ mod tests {
                 "unit": "credits",
                 "remaining": 75
             }]
-        }));
+        }))
+        .expect("snapshot");
         assert_eq!(snapshot.primary.used_percent, 25.0);
         assert_eq!(
             snapshot.primary.reset_description.as_deref(),
@@ -345,7 +349,8 @@ mod tests {
                 "limit": 50,
                 "reset_time": 40
             }]
-        }));
+        }))
+        .expect("snapshot");
         assert_eq!(snapshot.primary.used_percent, 20.0);
         assert!(snapshot.primary.resets_at.is_none());
         assert_eq!(
@@ -362,7 +367,8 @@ mod tests {
                 "limit": 2,
                 "resets_at": "2026-08-01T00:00:00Z"
             }]
-        }));
+        }))
+        .expect("snapshot");
         assert_eq!(
             snapshot.primary.resets_at,
             Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap())
@@ -373,7 +379,8 @@ mod tests {
     fn usage_percent_one_stays_one() {
         let snapshot = snapshot_from_usage(&serde_json::json!({
             "quotas": [{"usage_percent": 1, "limit": 100}]
-        }));
+        }))
+        .expect("snapshot");
         assert_eq!(snapshot.primary.used_percent, 1.0);
     }
 
@@ -381,7 +388,8 @@ mod tests {
     fn usage_percent_half_stays_half() {
         let snapshot = snapshot_from_usage(&serde_json::json!({
             "quotas": [{"usage_percent": 0.5, "limit": 100}]
-        }));
+        }))
+        .expect("snapshot");
         assert_eq!(snapshot.primary.used_percent, 0.5);
     }
 
@@ -389,7 +397,32 @@ mod tests {
     fn usage_percent_hundred_stays_hundred() {
         let snapshot = snapshot_from_usage(&serde_json::json!({
             "quotas": [{"usage_percent": 100, "limit": 100}]
-        }));
+        }))
+        .expect("snapshot");
         assert_eq!(snapshot.primary.used_percent, 100.0);
+    }
+}
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    #[test]
+    fn payload_without_a_quota_is_an_error_not_zero_percent() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"quotas": []}),
+            serde_json::json!({"quotas": [{"unit": "credits"}]}),
+        ] {
+            assert!(snapshot_from_usage(&body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = snapshot_from_usage(&serde_json::json!({"quotas":[{"used":0,"limit":100}]}))
+            .expect("snapshot");
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(snapshot.primary.used_percent, 0.0);
     }
 }

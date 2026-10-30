@@ -58,7 +58,7 @@ mod tests {
     fn web_ui_skips_windows_marked_idle() {
         let html = render_shell(60);
         assert!(html.contains("function visibleWindows(windows)"));
-        assert!(html.contains("w.idle !== true"));
+        assert!(html.contains("w.idle !== true && w.unavailable !== true"));
         assert!(html.contains("visibleWindows(account.windows).forEach"));
         assert!(html.contains("visibleWindows(row.windows).forEach"));
     }

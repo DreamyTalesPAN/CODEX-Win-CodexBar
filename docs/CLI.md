@@ -81,6 +81,7 @@ Exit codes (stable intent): `0` ok, `1` below threshold, usage errors for bad ar
 
 ```powershell
 codexbar serve --port 8080
+codexbar serve --request-timeout 20   # answer 504 after 20 s; 0 (default) waits
 # Non-loopback binds need a dashboard token and --allow-plain-http (cleartext bearer).
 # Prefer: $env:CODEXBAR_DASHBOARD_TOKEN = '...'
 ```
@@ -91,6 +92,7 @@ Typical endpoints: `/health`, `/usage`, `/cost` (and dashboard snapshot routes w
 
 ```powershell
 codexbar config providers
+codexbar config providers --json      # [{provider, displayName, enabled, defaultEnabled}]
 codexbar config enable -p cursor
 codexbar config disable -p cursor
 printf '%s' $env:OPENROUTER_API_KEY | codexbar config set-api-key -p openrouter --stdin

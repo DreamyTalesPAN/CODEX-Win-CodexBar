@@ -170,20 +170,19 @@ impl CursorApi {
         let (percent_used, secondary, model_specific, cost_snapshot) =
             if let Some(individual) = &summary.individual_usage {
                 if let Some(plan) = &individual.plan {
-                    let used_cents = plan.used.unwrap_or(0) as f64;
-                    let limit_cents = plan
-                        .limit
-                        .or_else(|| plan.breakdown.as_ref().and_then(|b| b.total))
-                        .unwrap_or(0) as f64;
+                    let counters = used_and_limit(
+                        plan.used,
+                        plan.limit
+                            .or_else(|| plan.breakdown.as_ref().and_then(|b| b.total)),
+                        plan.remaining,
+                    );
 
                     // Upstream #2255: clamp plan usage at 100% when included usage
                     // exceeds the plan limit (overage must not paint >100% bars).
                     let percent = if let Some(percent) = plan.total_percent_used {
-                        clamp_percent(percent)
-                    } else if limit_cents > 0.0 {
-                        clamp_percent((used_cents / limit_cents) * 100.0)
+                        Some(clamp_percent(percent))
                     } else {
-                        0.0
+                        counters.map(|(used, limit)| clamp_percent(used / limit * 100.0))
                     };
 
                     let secondary = plan.auto_percent_used.map(|v| {
@@ -200,42 +199,44 @@ impl CursorApi {
                                 Self::on_demand_cost(team.on_demand.as_ref(), billing_end)
                             })
                         })
-                        .unwrap_or_else(|| {
+                        .or_else(|| {
                             // Plan-included spend (cents → USD) when on-demand is off.
+                            let (used_cents, limit_cents) = counters?;
                             let mut cost = CostSnapshot::new(
                                 used_cents / 100.0,
                                 "USD",
                                 plan_period_label(summary.billing_cycle_start.as_deref()),
-                            );
-                            if limit_cents > 0.0 {
-                                cost = cost.with_limit(limit_cents / 100.0);
-                            }
+                            )
+                            .with_limit(limit_cents / 100.0);
                             if let Some(reset) = billing_end {
                                 cost = cost.with_resets_at(reset);
                             }
-                            cost
+                            Some(cost)
                         });
 
-                    (percent, secondary, model_specific, Some(cost))
+                    (percent, secondary, model_specific, cost)
                 } else if let Some(overall) = &individual.overall {
-                    let percent = Self::usage_percent(overall).unwrap_or(0.0);
+                    let percent = Self::usage_percent(overall);
                     let cost = Self::on_demand_cost(Some(overall), billing_end);
                     (percent, None, None, cost)
                 } else {
-                    (0.0, None, None, None)
+                    (None, None, None, None)
                 }
             } else if let Some(team) = &summary.team_usage {
                 if let Some(pooled) = &team.pooled {
-                    let percent = Self::usage_percent(pooled).unwrap_or(0.0);
+                    let percent = Self::usage_percent(pooled);
                     let cost = Self::on_demand_cost(Some(pooled), billing_end);
                     (percent, None, None, cost)
                 } else {
-                    (0.0, None, None, None)
+                    (None, None, None, None)
                 }
             } else {
-                (0.0, None, None, None)
+                (None, None, None, None)
             };
 
+        let percent_used = percent_used.ok_or_else(|| {
+            ProviderError::Parse("Cursor usage summary has no usable quota".to_string())
+        })?;
         let primary = RateWindow::with_details(percent_used, None, billing_end, None);
 
         let plan_type = summary
@@ -298,17 +299,25 @@ impl CursorApi {
     }
 
     fn usage_percent(usage: &OnDemandUsage) -> Option<f64> {
-        let used = usage.used.unwrap_or(0) as f64;
-        let limit = usage
-            .limit
-            .or_else(|| {
-                usage
-                    .remaining
-                    .map(|remaining| remaining + usage.used.unwrap_or(0))
-            })
-            .unwrap_or(0) as f64;
-        (limit > 0.0).then_some(clamp_percent(used / limit * 100.0))
+        let (used, limit) = used_and_limit(usage.used, usage.limit, usage.remaining)?;
+        Some(clamp_percent(used / limit * 100.0))
     }
+}
+
+/// `(used, limit)` in cents when two of used/limit/remaining are known and the
+/// limit is positive. A missing counter is never read as zero.
+fn used_and_limit(
+    used: Option<i64>,
+    limit: Option<i64>,
+    remaining: Option<i64>,
+) -> Option<(f64, f64)> {
+    let (used, limit) = match (used, limit, remaining) {
+        (Some(used), Some(limit), _) => (used, limit),
+        (Some(used), None, Some(remaining)) => (used, used + remaining),
+        (None, Some(limit), Some(remaining)) => (limit - remaining, limit),
+        _ => return None,
+    };
+    (limit > 0).then_some((used as f64, limit as f64))
 }
 
 fn clamp_percent(value: f64) -> f64 {
@@ -708,22 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_build_result_missing_plan() {
-        let json = r#"{
-            "membershipType": "hobby",
-            "individualUsage": {}
-        }"#;
-
-        let summary = parse_summary(json);
-        let result = api().build_result(summary, None).unwrap();
-
-        assert!((result.primary.used_percent).abs() < 0.01);
-        assert!(result.secondary.is_none());
-        assert!(result.model_specific.is_none());
-        assert!(result.cost.is_none());
-    }
-
-    #[test]
     fn test_cursor_on_demand_as_cost() {
         let json = r#"{
             "billingCycleEnd": "2026-04-01T00:00:00Z",
@@ -791,5 +784,95 @@ mod tests {
         let result = api().build_result(summary, None).unwrap();
         assert!((result.primary.used_percent - 50.0).abs() < 0.01);
         assert_eq!(result.cost.unwrap().used, 50.0);
+    }
+}
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    fn build(body: &str) -> Result<CursorUsageResult, ProviderError> {
+        let summary: UsageSummary = serde_json::from_str(body).expect("summary");
+        CursorApi::new().build_result(summary, None)
+    }
+
+    #[test]
+    fn summary_without_a_quota_is_an_error_not_zero_percent() {
+        for body in [
+            r#"{}"#,
+            r#"{"individualUsage":{}}"#,
+            r#"{"individualUsage":{"plan":{"used":500}}}"#,
+            r#"{"individualUsage":{"overall":{"used":5}}}"#,
+            r#"{"teamUsage":{}}"#,
+            r#"{"teamUsage":{"pooled":{"used":5}}}"#,
+        ] {
+            assert!(build(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn limit_without_a_used_counter_is_not_zero_percent() {
+        for body in [
+            r#"{"individualUsage":{"plan":{"limit":2000}}}"#,
+            r#"{"individualUsage":{"plan":{"breakdown":{"total":2000}}}}"#,
+            r#"{"individualUsage":{"overall":{"limit":2000}}}"#,
+            r#"{"individualUsage":{"overall":{"remaining":500}}}"#,
+            r#"{"teamUsage":{"pooled":{"limit":2000}}}"#,
+            r#"{"teamUsage":{"pooled":{"remaining":500}}}"#,
+        ] {
+            assert!(build(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn used_is_derived_from_limit_and_remaining() {
+        for (body, percent) in [
+            (
+                r#"{"individualUsage":{"plan":{"limit":2000,"remaining":500}}}"#,
+                75.0,
+            ),
+            (
+                r#"{"individualUsage":{"overall":{"limit":2000,"remaining":500}}}"#,
+                75.0,
+            ),
+            (
+                r#"{"individualUsage":{"overall":{"used":500,"remaining":1500}}}"#,
+                25.0,
+            ),
+            (
+                r#"{"teamUsage":{"pooled":{"limit":2000,"remaining":0}}}"#,
+                100.0,
+            ),
+            (
+                r#"{"individualUsage":{"plan":{"limit":2000,"remaining":2000}}}"#,
+                0.0,
+            ),
+        ] {
+            let result = build(body).expect(body);
+            assert!(
+                (result.primary.used_percent - percent).abs() < 0.01,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn percentage_without_counters_has_no_invented_plan_cost() {
+        let result = build(r#"{"individualUsage":{"plan":{"totalPercentUsed":12}}}"#).unwrap();
+        assert!((result.primary.used_percent - 12.0).abs() < 0.01);
+        assert!(result.cost.is_none());
+    }
+
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        for body in [
+            r#"{"individualUsage":{"plan":{"used":0,"limit":2000}}}"#,
+            r#"{"individualUsage":{"plan":{"totalPercentUsed":0}}}"#,
+            r#"{"individualUsage":{"overall":{"used":0,"limit":2000}}}"#,
+            r#"{"teamUsage":{"pooled":{"used":0,"limit":2000}}}"#,
+        ] {
+            let result = build(body).expect(body);
+            assert_eq!(result.primary.used_percent, 0.0, "{body}");
+        }
     }
 }

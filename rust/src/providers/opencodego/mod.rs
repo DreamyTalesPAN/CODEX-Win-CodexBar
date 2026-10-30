@@ -160,35 +160,40 @@ impl OpenCodeGoProvider {
 
     fn parse_usage_text(text: &str) -> Result<UsageSnapshot, ProviderError> {
         let now = Utc::now();
+        let reset_at =
+            |seconds: Option<i64>| seconds.map(|seconds| now + chrono::Duration::seconds(seconds));
 
-        let rolling = Self::extract_window(text, &["rollingUsage", "rolling_usage", "rolling"])
-            .ok_or_else(|| ProviderError::Parse("Missing rolling usage window".to_string()))?;
+        let rolling = Self::extract_window(text, &["rollingUsage", "rolling_usage", "rolling"]);
         let weekly = Self::extract_window(text, &["weeklyUsage", "weekly_usage", "weekly"]);
         let monthly = Self::extract_window(text, &["monthlyUsage", "monthly_usage", "monthly"]);
 
-        let primary = RateWindow::with_details(
-            rolling.0,
-            Some(300),
-            Some(now + chrono::Duration::seconds(rolling.1)),
-            None,
-        );
+        if rolling.is_none() && weekly.is_none() && monthly.is_none() {
+            return Err(ProviderError::Parse(
+                "OpenCode Go response contains no usable usage windows".into(),
+            ));
+        }
+        let primary = rolling
+            .map(|(percent, reset)| {
+                RateWindow::with_details(percent, Some(300), reset_at(reset), None)
+            })
+            .unwrap_or_else(|| RateWindow::informational("Rolling usage unavailable"));
         let mut snap = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
 
         if let Some((pct, reset)) = weekly {
             snap = snap.with_secondary(RateWindow::with_details(
                 pct,
                 Some(10080),
-                Some(now + chrono::Duration::seconds(reset)),
+                reset_at(reset),
                 None,
             ));
         }
 
         if let Some((pct, reset)) = monthly {
-            let resets_at = now + chrono::Duration::seconds(reset);
+            let resets_at = reset_at(reset);
             snap = snap.with_tertiary(RateWindow::with_details(
                 pct,
-                RateWindow::monthly_window_minutes(Some(resets_at)).or(Some(43200)),
-                Some(resets_at),
+                RateWindow::monthly_window_minutes(resets_at).or(Some(43200)),
+                resets_at,
                 None,
             ));
         }
@@ -204,8 +209,8 @@ impl OpenCodeGoProvider {
         Ok(snap)
     }
 
-    /// Extract `(percent, resetInSec)` for a usage block by name.
-    fn extract_window(text: &str, names: &[&str]) -> Option<(f64, i64)> {
+    /// Extract `(percent, resetInSec if present)` for a usage block by name.
+    fn extract_window(text: &str, names: &[&str]) -> Option<(f64, Option<i64>)> {
         for name in names {
             let percent_pattern = format!(
                 r#"{}[^}}]*?(?:usagePercent|usedPercent|percentUsed|percent)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)"#,
@@ -222,11 +227,9 @@ impl OpenCodeGoProvider {
                     clippy::cast_possible_truncation,
                     reason = "resetInSec values are whole-second counts scraped as integral numbers"
                 )]
-                let reset = super::extract_number(&reset_pattern, text)
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
+                let reset = super::extract_number(&reset_pattern, text).map(|n| n as i64);
                 // Direct percent fields arrive as integer percent in the serialized payload; no fraction scaling (upstream parseSubscription parity; win-fork #247).
-                return Some((p.clamp(0.0, 100.0), reset.max(0)));
+                return Some((p.clamp(0.0, 100.0), reset.map(|seconds| seconds.max(0))));
             }
 
             // Computed used/limit (already 0..100) — do not apply fraction *100.
@@ -247,11 +250,9 @@ impl OpenCodeGoProvider {
                     clippy::cast_possible_truncation,
                     reason = "resetInSec values are whole-second counts scraped as integral numbers"
                 )]
-                let reset = super::extract_number(&reset_pattern, text)
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
+                let reset = super::extract_number(&reset_pattern, text).map(|n| n as i64);
                 let p = (used / limit) * 100.0;
-                return Some((p.clamp(0.0, 100.0), reset.max(0)));
+                return Some((p.clamp(0.0, 100.0), reset.map(|seconds| seconds.max(0))));
             }
         }
         None
@@ -794,6 +795,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn percent_without_reset_keeps_reset_unknown() {
+        let text = "rollingUsage: { usagePercent: 10 }, weeklyUsage: { usagePercent: 50, resetInSec: 3600 }, monthlyUsage: { usagePercent: 5 }";
+        let snap = OpenCodeGoProvider::parse_usage_text(text).expect("snapshot");
+        assert_eq!(snap.primary.used_percent, 10.0);
+        assert_eq!(snap.primary.resets_at, None);
+        assert!(snap.secondary.as_ref().unwrap().resets_at.is_some());
+        let monthly = snap.tertiary.as_ref().unwrap();
+        assert_eq!(monthly.used_percent, 5.0);
+        assert_eq!(monthly.resets_at, None);
+    }
+
+    #[test]
+    fn explicit_zero_reset_stays_a_reset() {
+        let text = "rollingUsage: { usagePercent: 10, resetInSec: 0 }";
+        let snap = OpenCodeGoProvider::parse_usage_text(text).expect("snapshot");
+        assert!(snap.primary.resets_at.is_some());
+    }
+
+    #[test]
     fn parses_workspace_ids() {
         let text = r#"{ id: "wrk_abc123", name: "x" } { id: "wrk_def456" }"#;
         let ids = OpenCodeGoProvider::parse_workspace_ids(text);
@@ -977,5 +997,47 @@ mod tests {
         );
         // Marker alone is not enough.
         assert_eq!(parse_billing_server_balance(r#"customerID: "cus_9""#), None);
+    }
+}
+
+#[cfg(test)]
+mod p1_17_weekly_only_preserves_zero_and_nonzero_usage_tests {
+    use super::*;
+    #[test]
+    fn review16_p1_17_weekly_only_preserves_zero_and_nonzero_usage() {
+        for percent in [0, 40] {
+            let snapshot = OpenCodeGoProvider::parse_usage_text(&format!(
+                "weeklyUsage: {{ usagePercent: {percent}, resetInSec: 3600 }}"
+            ))
+            .unwrap();
+            assert!(snapshot.primary.is_informational);
+            assert!(snapshot.primary.resets_at.is_none());
+            let weekly = snapshot.secondary.unwrap();
+            assert!(!weekly.is_informational);
+            assert_eq!(weekly.used_percent, f64::from(percent));
+            assert!(weekly.resets_at.is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod p2_02_empty_usage_is_a_data_error_tests {
+    use super::*;
+    #[test]
+    fn review16_p2_02_empty_usage_is_a_data_error() {
+        let error = OpenCodeGoProvider::parse_usage_text("{}").unwrap_err();
+        assert!(matches!(error, ProviderError::Parse(_)));
+        let text = error.to_string().to_lowercase();
+        for marker in [
+            "missing",
+            "not found",
+            "required",
+            "auth",
+            "token",
+            "cookie",
+            "login",
+        ] {
+            assert!(!text.contains(marker), "{text}");
+        }
     }
 }

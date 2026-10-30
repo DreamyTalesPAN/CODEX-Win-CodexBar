@@ -161,6 +161,11 @@ impl<'de> Deserialize<'de> for UsageResponse {
                     }
                     let window: UsageWindow =
                         serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                    // A window without utilization carries no reading; treat it
+                    // as absent instead of reporting a 0% quota.
+                    if window.utilization.is_none() {
+                        continue;
+                    }
                     return Ok(Some(window));
                 }
             }
@@ -468,7 +473,7 @@ impl ClaudeWebApiFetcher {
         headers
     }
 
-    fn resolve_session_key_from_env() -> Option<String> {
+    pub(super) fn resolve_session_key_from_env() -> Option<String> {
         for env_name in ["CLAUDE_AI_SESSION_KEY", "CLAUDE_WEB_SESSION_KEY"] {
             let Ok(value) = std::env::var(env_name) else {
                 continue;
@@ -955,6 +960,48 @@ mod tests {
         }
     }
 
+    // A session key in the environment is the sign-in of VibeTV's own Claude
+    // window (#273). Auto must read claude.ai with it and nothing else, so a
+    // signed-in Claude Code (a second account) cannot answer instead.
+    #[test]
+    fn auto_with_a_window_session_returns_only_the_web_error() {
+        use crate::core::{FetchContext, Provider};
+
+        let _guard = env_lock().lock().expect("env lock");
+        // SAFETY: env_lock() held for this whole test; restored before release.
+        unsafe {
+            std::env::remove_var("CLAUDE_WEB_SESSION_KEY");
+            std::env::set_var("CLAUDE_AI_SESSION_KEY", "sk-ant-window-session");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(crate::providers::ClaudeProvider::new().fetch_usage(
+            &FetchContext {
+                web_timeout: 5,
+                ..FetchContext::default()
+            },
+        ));
+
+        // SAFETY: same env_lock()-guarded mutation.
+        unsafe {
+            std::env::remove_var("CLAUDE_AI_SESSION_KEY");
+        }
+
+        // The fake key never works, so claude.ai (or the network) refuses it.
+        let message = result
+            .expect_err("a fake session key cannot read usage")
+            .to_string();
+        assert!(
+            !message.contains("all configured sources")
+                && !message.contains("OAuth:")
+                && !message.contains("CLI:"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn build_headers_include_required_browser_context() {
         let headers = ClaudeWebApiFetcher::build_headers("sessionKey=sk-ant-cookie-format");
@@ -1299,3 +1346,32 @@ mod tests {
 #[cfg(test)]
 #[path = "cloudflare_tests.rs"]
 mod cloudflare_tests;
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    fn windows(body: &str) -> (RateWindow, Option<RateWindow>, Option<RateWindow>) {
+        let usage: UsageResponse = serde_json::from_str(body).expect("usage body");
+        ClaudeWebApiFetcher::new().build_rate_windows(&usage)
+    }
+
+    #[test]
+    fn window_without_utilization_is_not_a_zero_percent_quota() {
+        let (primary, secondary, _) = windows(r#"{"five_hour":{},"seven_day":{"resets_at":null}}"#);
+
+        assert!(primary.is_informational);
+        assert!(secondary.is_none());
+    }
+
+    #[test]
+    fn real_zero_utilization_stays_a_quota() {
+        let (primary, secondary, _) = windows(
+            r#"{"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":0}}"#,
+        );
+
+        assert!(!primary.is_informational);
+        assert_eq!(primary.used_percent, 0.0);
+        assert_eq!(secondary.expect("weekly").used_percent, 0.0);
+    }
+}

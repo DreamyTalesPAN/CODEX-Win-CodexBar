@@ -87,6 +87,19 @@ pub struct ServeArgs {
     /// request (upstream 0.50.1 #2960).
     #[arg(long, value_parser = ["redacted", "full"])]
     pub identity: Option<String>,
+
+    /// Total per-request deadline in seconds; 0 disables (default: 0)
+    ///
+    /// CodexBar's own `serve` option. A request still unanswered after this
+    /// long gets `504 Gateway Timeout`; its work runs on to the end. Unlike
+    /// CodexBar, whose default is 30, the default here stays "no deadline",
+    /// which is how this server behaved before the option existed.
+    #[arg(
+        long = "request-timeout",
+        value_name = "SECONDS",
+        default_value_t = 0.0
+    )]
+    pub request_timeout: f64,
 }
 
 /// Normalized serve bind configuration after startup validation.
@@ -102,6 +115,9 @@ struct ServeConfig {
     /// Dashboard snapshot identity mode. `None` means follow the app's
     /// `hide_personal_info` setting per request (upstream 0.50.1 #2960).
     identity: Option<DashboardIdentity>,
+    /// Deadline for answering one request (`--request-timeout`); `None`
+    /// waits for the answer however long it takes.
+    request_timeout: Option<Duration>,
     /// Dashboard state (coordinator + producer). Always `Some` from `run`;
     /// `None` only in pure-transport tests, where dashboard routes answer 503.
     dashboard: Option<dashboard::DashboardState>,
@@ -198,8 +214,27 @@ fn validate_serve_args(args: &ServeArgs) -> anyhow::Result<ServeConfig> {
         token_digest: token.as_ref().map(|t| sha256_digest(t.as_bytes())),
         head_read_budget: HEAD_READ_TIMEOUT,
         identity,
+        request_timeout: request_timeout(args.request_timeout)?,
         dashboard: None,
     })
+}
+
+/// Upstream's longest request deadline: one day.
+const MAX_REQUEST_TIMEOUT_SECS: f64 = 86_400.0;
+
+/// `--request-timeout` as CodexBar reads it: seconds, fractions allowed,
+/// capped at a day; zero means no deadline; negative or non-finite is an
+/// error.
+fn request_timeout(seconds: f64) -> anyhow::Result<Option<Duration>> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        anyhow::bail!("--request-timeout must be zero or greater.");
+    }
+    if seconds == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(Duration::from_secs_f64(
+        seconds.min(MAX_REQUEST_TIMEOUT_SECS),
+    )))
 }
 
 fn resolve_dashboard_token(cli_token: Option<&str>) -> anyhow::Result<Option<String>> {
@@ -326,12 +361,38 @@ async fn handle_client(mut stream: TcpStream, config: &ServeConfig) -> anyhow::R
     };
     let request = String::from_utf8_lossy(&head);
     let response = match parse_request(&request) {
-        Ok(request) => route_request(&request, config).await,
+        Ok(request) => match config.request_timeout {
+            None => route_request(&request, config).await,
+            Some(deadline) => {
+                let config = config.clone();
+                answer_within(
+                    deadline,
+                    async move { route_request(&request, &config).await },
+                )
+                .await
+            }
+        },
         Err(status) => json_response(status, serde_json::json!({ "error": "bad request" })),
     };
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+/// Answer of `work`, or `504 Gateway Timeout` once `deadline` has passed.
+///
+/// The work runs as its own task and is not stopped at the deadline: a slow
+/// dashboard snapshot still finishes and lands in the coordinator's cache for
+/// the next request, as upstream's `--request-timeout` describes.
+async fn answer_within<F>(deadline: Duration, work: F) -> String
+where
+    F: std::future::Future<Output = String> + Send + 'static,
+{
+    match tokio::time::timeout(deadline, tokio::spawn(work)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => json_response(500, serde_json::json!({ "error": "internal error" })),
+        Err(_) => json_response(504, serde_json::json!({ "error": "request timed out" })),
+    }
 }
 
 /// Read one complete request head under one overall deadline.
@@ -695,6 +756,7 @@ fn http_response(
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Internal Server Error",
     };
     let extra = extra_headers

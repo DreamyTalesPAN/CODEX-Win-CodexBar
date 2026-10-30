@@ -566,6 +566,10 @@ impl Default for Settings {
 impl Settings {
     /// Get the settings file path
     pub fn settings_path() -> Option<PathBuf> {
+        // CODEXBAR_CONFIG points at the settings file itself (same contract as macOS).
+        if let Some(path) = std::env::var_os("CODEXBAR_CONFIG").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(path));
+        }
         crate::logging::config_root().map(|p| p.join("settings.json"))
     }
 

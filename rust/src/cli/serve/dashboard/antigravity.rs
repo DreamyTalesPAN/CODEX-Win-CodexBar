@@ -41,12 +41,14 @@ pub(super) fn quota_summary_windows(
         ));
     }
     windows.extend(usage.extra_rate_windows.iter().map(|extra| {
-        make_window_with_idle(
+        let mut window = make_window_with_idle(
             &extra.id,
             &extra.title,
             &extra.window,
             idle_ids.contains(&extra.id),
-        )
+        );
+        window.unavailable |= !extra.usage_known;
+        window
     }));
     windows
 }

@@ -50,11 +50,11 @@ impl CreditsData {
         (self.total_credits - self.total_usage).max(0.0)
     }
 
-    fn used_percent(&self) -> f64 {
+    fn used_percent(&self) -> Option<f64> {
         if self.total_credits > 0.0 {
-            ((self.total_usage / self.total_credits) * 100.0).min(100.0)
+            Some(((self.total_usage / self.total_credits) * 100.0).min(100.0))
         } else {
-            0.0
+            None
         }
     }
 }
@@ -269,8 +269,12 @@ impl OpenRouterProvider {
 
     fn build_credits_usage(credits: &CreditsData) -> UsageSnapshot {
         let balance = credits.balance();
-        let mut primary = RateWindow::new(credits.used_percent());
-        primary.reset_description = Some(format!("${:.2} remaining", balance));
+        let detail = format!("${:.2} remaining", balance);
+        let mut primary = credits
+            .used_percent()
+            .map(RateWindow::new)
+            .unwrap_or_else(|| RateWindow::informational(&detail));
+        primary.reset_description = Some(detail);
 
         UsageSnapshot::new(primary).with_login_method(format!("${:.2} balance", balance))
     }
@@ -392,8 +396,7 @@ impl OpenRouterProvider {
             return;
         };
 
-        let mut window = RateWindow::new(0.0);
-        window.reset_description = Some(format!("${spend:.2} {period}"));
+        let window = RateWindow::informational(format!("${spend:.2} {period}"));
         *usage = usage.clone().with_extra_rate_window(id, label, window);
     }
 }
@@ -661,5 +664,51 @@ mod tests {
         assert_eq!(parsed.data.limit, Some(50.0));
         assert_eq!(parsed.data.limit_remaining, Some(12.5));
         assert_eq!(parsed.data.limit_reset.as_deref(), Some("monthly"));
+    }
+}
+
+#[cfg(test)]
+mod informational_tests {
+    use super::*;
+    #[test]
+    fn spend_windows_are_information() {
+        let mut usage = OpenRouterProvider::build_credits_usage(&CreditsData {
+            total_credits: 100.0,
+            total_usage: 0.0,
+        });
+        let key: KeyData =
+            serde_json::from_str(r#"{"usage_daily":0,"usage_weekly":2,"usage_monthly":5}"#)
+                .unwrap();
+        OpenRouterProvider::enrich_usage_with_key_data(&mut usage, key);
+        assert_eq!(usage.extra_rate_windows.len(), 3);
+        assert!(
+            usage
+                .extra_rate_windows
+                .iter()
+                .all(|w| w.window.is_informational)
+        );
+        assert!(usage.secondary.is_none());
+    }
+    #[test]
+    fn zero_denominator_is_not_a_quota() {
+        let usage = OpenRouterProvider::build_credits_usage(&CreditsData {
+            total_credits: 0.0,
+            total_usage: 5.0,
+        });
+        assert!(usage.primary.is_informational);
+        assert!(serde_json::from_str::<CreditsData>("{}").is_err());
+    }
+    #[test]
+    fn real_zero_credit_and_key_usage_stays_available() {
+        let mut usage = OpenRouterProvider::build_credits_usage(&CreditsData {
+            total_credits: 100.0,
+            total_usage: 0.0,
+        });
+        let key = serde_json::from_str(r#"{"limit":10,"usage":0}"#).unwrap();
+        OpenRouterProvider::add_key_quota(&mut usage, &key);
+        for w in [usage.primary, usage.secondary.unwrap()] {
+            assert!(!w.is_informational);
+            assert_eq!(w.used_percent, 0.0);
+        }
     }
 }

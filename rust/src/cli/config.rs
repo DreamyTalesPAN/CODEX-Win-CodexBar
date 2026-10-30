@@ -30,7 +30,23 @@ pub enum ConfigCommand {
         show_secrets: bool,
     },
     /// List providers and enabled state
-    Providers,
+    Providers {
+        /// Output format: text or json
+        #[arg(short, long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Shorthand for --format json
+        #[arg(long)]
+        json: bool,
+        /// Pretty-print JSON output
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Allow or stop reading Claude Code's own credentials for Claude usage
+    ClaudeConsent {
+        /// on or off
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     /// Enable a provider
     Enable {
         /// Provider CLI name or alias
@@ -67,7 +83,12 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             format,
             show_secrets,
         } => dump_config(&format, show_secrets).await,
-        ConfigCommand::Providers => list_providers().await,
+        ConfigCommand::Providers {
+            format,
+            json,
+            pretty,
+        } => list_providers(json || format == "json", pretty).await,
+        ConfigCommand::ClaudeConsent { state } => set_claude_consent(state == "on").await,
         ConfigCommand::Enable { provider } => set_provider_enabled(&provider, true).await,
         ConfigCommand::Disable { provider } => set_provider_enabled(&provider, false).await,
         ConfigCommand::SetApiKey {
@@ -335,27 +356,68 @@ fn listed_providers(settings: &Settings) -> Vec<ProviderId> {
 }
 
 /// List provider enabled state.
-async fn list_providers() -> anyhow::Result<()> {
-    let settings = Settings::load();
-    for id in listed_providers(&settings) {
-        let state = if settings.is_provider_enabled(id) {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        let default_marker = if instantiate_provider(id).metadata().default_enabled {
-            " default"
-        } else {
-            ""
-        };
-        println!(
-            "{}: {}{} ({})",
-            id.cli_name(),
-            state,
-            default_marker,
-            id.display_name()
-        );
+async fn list_providers(as_json: bool, pretty: bool) -> anyhow::Result<()> {
+    let statuses = provider_statuses(&Settings::load());
+    if as_json {
+        println!("{}", provider_statuses_json(&statuses, pretty)?);
+    } else {
+        for status in &statuses {
+            println!("{}", status.text_line());
+        }
     }
+    Ok(())
+}
+
+/// One provider of the inventory, in the shape of CodexBar's own
+/// `config providers --json` (upstream `ConfigProviderStatusResult`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderStatus {
+    default_enabled: bool,
+    display_name: String,
+    enabled: bool,
+    provider: String,
+}
+
+impl ProviderStatus {
+    /// The text form: `codex: enabled default (Codex)`.
+    fn text_line(&self) -> String {
+        let state = if self.enabled { "enabled" } else { "disabled" };
+        let default_marker = if self.default_enabled { " default" } else { "" };
+        format!(
+            "{}: {}{} ({})",
+            self.provider, state, default_marker, self.display_name
+        )
+    }
+}
+
+/// Listed providers with their switched-on state; the text and the
+/// JSON listing print these same rows.
+fn provider_statuses(settings: &Settings) -> Vec<ProviderStatus> {
+    listed_providers(settings)
+        .iter()
+        .map(|id| ProviderStatus {
+            default_enabled: instantiate_provider(*id).metadata().default_enabled,
+            display_name: id.display_name().to_string(),
+            enabled: settings.is_provider_enabled(*id),
+            provider: id.cli_name().to_string(),
+        })
+        .collect()
+}
+
+fn provider_statuses_json(statuses: &[ProviderStatus], pretty: bool) -> anyhow::Result<String> {
+    Ok(if pretty {
+        serde_json::to_string_pretty(statuses)?
+    } else {
+        serde_json::to_string(statuses)?
+    })
+}
+
+async fn set_claude_consent(allowed: bool) -> anyhow::Result<()> {
+    let mut settings = Settings::load();
+    settings.claude_allow_reading_claude_code_credentials = allowed;
+    settings.save()?;
+    println!("claude_allow_reading_claude_code_credentials: {allowed}");
     Ok(())
 }
 
@@ -490,12 +552,141 @@ async fn show_paths() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigFileError, listed_providers, read_json_config, sanitize_settings_for_dump};
+    use super::{
+        ConfigArgs, ConfigCommand, ConfigFileError, ProviderStatus, listed_providers,
+        provider_statuses, provider_statuses_json, read_json_config, sanitize_settings_for_dump,
+    };
     use crate::core::ProviderId;
     #[cfg(windows)]
     use crate::secure_file;
-    use crate::settings::{ManualCookies, Settings};
+    use crate::settings::ManualCookies;
+    use crate::settings::Settings;
+    use clap::Parser;
     use serde_json::json;
+
+    /// The first entries of CodexBar 0.63.0's (macOS) `config providers
+    /// --json`, as VibeTV recorded and parses them.
+    const MAC_PROVIDER_ROWS: &str = r#"[
+  {
+    "defaultEnabled": true,
+    "displayName": "Codex",
+    "enabled": true,
+    "provider": "codex"
+  },
+  {
+    "defaultEnabled": false,
+    "displayName": "Claude",
+    "enabled": true,
+    "provider": "claude"
+  }
+]"#;
+
+    #[test]
+    fn provider_inventory_json_has_the_mac_cli_shape() {
+        let rows = vec![
+            ProviderStatus {
+                default_enabled: true,
+                display_name: "Codex".into(),
+                enabled: true,
+                provider: "codex".into(),
+            },
+            ProviderStatus {
+                default_enabled: false,
+                display_name: "Claude".into(),
+                enabled: true,
+                provider: "claude".into(),
+            },
+        ];
+        // Pretty output is the recording byte for byte: names, order, types.
+        assert_eq!(
+            provider_statuses_json(&rows, true).unwrap(),
+            MAC_PROVIDER_ROWS
+        );
+        let compact = provider_statuses_json(&rows, false).unwrap();
+        assert!(!compact.contains('\n'));
+        let recorded: serde_json::Value = serde_json::from_str(MAC_PROVIDER_ROWS).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&compact).unwrap(),
+            recorded
+        );
+    }
+
+    #[test]
+    fn provider_inventory_lists_every_provider_with_its_state() {
+        let mut settings = Settings::default();
+        settings.enabled_providers.clear();
+        settings.enable_provider(ProviderId::Claude);
+        let rows = provider_statuses(&settings);
+        assert_eq!(rows.len(), listed_providers(&settings).len());
+        let row = |name: &str| rows.iter().find(|row| row.provider == name).unwrap();
+        assert!(row("claude").enabled);
+        assert_eq!(row("claude").display_name, "Claude");
+        assert!(!row("codex").enabled);
+        // The text listing is unchanged and comes from the same rows.
+        assert!(row("claude").text_line().starts_with("claude: enabled"));
+        assert!(row("claude").text_line().ends_with("(Claude)"));
+        assert!(row("codex").text_line().starts_with("codex: disabled"));
+    }
+
+    #[test]
+    fn provider_inventory_filters_deprecated_in_text_and_json() {
+        let mut settings = Settings::default();
+        settings.enabled_providers.clear();
+        for enabled in [false, true] {
+            if enabled {
+                settings.enable_provider(ProviderId::KimiK2);
+            }
+            let rows = provider_statuses(&settings);
+            let text = rows
+                .iter()
+                .map(ProviderStatus::text_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let json = provider_statuses_json(&rows, false).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                text.lines().any(|line| line.starts_with("kimik2:")),
+                enabled
+            );
+            assert_eq!(
+                parsed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["provider"] == "kimik2"),
+                enabled
+            );
+            assert!(!text.lines().any(|line| line.starts_with("crossmodel:")));
+            assert!(
+                !parsed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["provider"] == "crossmodel")
+            );
+        }
+    }
+
+    #[test]
+    fn providers_command_accepts_the_mac_cli_json_options() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["config", "providers"];
+            argv.extend_from_slice(args);
+            match ConfigArgs::try_parse_from(argv).map(|parsed| parsed.command) {
+                Ok(ConfigCommand::Providers {
+                    format,
+                    json,
+                    pretty,
+                }) => Some((json || format == "json", pretty)),
+                _ => None,
+            }
+        };
+        assert_eq!(parse(&[]), Some((false, false)));
+        assert_eq!(parse(&["--json"]), Some((true, false)));
+        assert_eq!(parse(&["--format", "json", "--pretty"]), Some((true, true)));
+        assert_eq!(parse(&["--format", "text"]), Some((false, false)));
+        assert_eq!(parse(&["--format", "yaml"]), None);
+    }
 
     #[cfg(windows)]
     #[test]

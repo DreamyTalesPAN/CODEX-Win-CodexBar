@@ -2038,6 +2038,70 @@ fn known_zero_is_not_set_when_scan_has_results() {
     assert!(!summary.known_zero, "scan with results is not known-zero");
 }
 
+// ── Claude history coverage (VibeTV #820) ───────────────────────────────
+
+#[test]
+fn claude_scan_with_usage_establishes_coverage() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("projects").join("demo");
+    std::fs::create_dir_all(&project).unwrap();
+    let ts = (Utc::now() - Duration::hours(1))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let line = claude_transcript_line(&ts, "requestId", "req_cov", "msg_cov");
+    std::fs::write(project.join("a.jsonl"), format!("{line}\n")).unwrap();
+
+    let summary = CostScanner::new(7).scan_claude_projects(&root.path().join("projects"), None);
+    assert_eq!(summary.sessions_count, 1);
+    assert!(summary.history_coverage_established, "completed scan");
+    assert!(!summary.known_zero, "scan with usage is not a known zero");
+}
+
+#[test]
+fn claude_scan_without_usage_is_a_known_zero() {
+    let root = tempfile::tempdir().unwrap();
+    let projects = root.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+
+    let summary = CostScanner::new(7).scan_claude_projects(&projects, None);
+    assert!(summary.history_coverage_established);
+    assert!(summary.known_zero);
+}
+
+#[test]
+fn claude_scan_without_projects_dir_does_not_establish_coverage() {
+    let root = tempfile::tempdir().unwrap();
+
+    let summary = CostScanner::new(7).scan_claude_projects(&root.path().join("missing"), None);
+    assert!(!summary.history_coverage_established);
+    assert!(!summary.known_zero, "a missing log folder is not a zero");
+}
+
+#[test]
+fn cancelled_claude_scan_does_not_establish_coverage() {
+    let root = tempfile::tempdir().unwrap();
+    let projects = root.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let cancel = AtomicBool::new(true);
+
+    let summary = CostScanner::new(7).scan_claude_projects(&projects, Some(&cancel));
+    assert!(!summary.history_coverage_established);
+    assert!(!summary.known_zero);
+}
+
+#[test]
+fn jsonl_read_error_is_reported() {
+    struct FailingReader;
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk"))
+        }
+    }
+    let read_ok = for_each_jsonl_text_line(BufReader::new(FailingReader), |_| true);
+    assert!(!read_ok, "a read error must not count as a complete file");
+    assert!(for_each_jsonl_text_line(&b"{}\n"[..], |_| true));
+}
+
 #[test]
 fn tiny_candidate_limit_prefers_newest_dirty_file_and_persists_older_pending() {
     let root = tempfile::tempdir().unwrap();

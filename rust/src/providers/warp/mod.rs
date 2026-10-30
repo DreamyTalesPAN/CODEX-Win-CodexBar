@@ -265,45 +265,41 @@ impl WarpProvider {
             workspaces,
         } = user;
 
-        let limit_info = request_limit_info.ok_or_else(|| {
-            ProviderError::Parse("Missing requestLimitInfo in response".to_string())
-        })?;
-        let primary = Self::primary_window(&limit_info);
-
-        let mut usage = UsageSnapshot::new(primary).with_login_method("Warp API");
-        if let Some(secondary) = Self::bonus_window(Self::all_bonus_grants(
+        let primary = request_limit_info.as_ref().and_then(Self::primary_window);
+        let secondary = Self::bonus_window(Self::all_bonus_grants(
             bonus_grants.as_ref(),
             workspaces.as_ref(),
-        )) {
+        ));
+        if primary.is_none() && secondary.is_none() {
+            return Err(ProviderError::Parse(
+                "Warp response contains no usable quota".into(),
+            ));
+        }
+        let mut usage = UsageSnapshot::new(
+            primary.unwrap_or_else(|| RateWindow::informational("Warp request usage unavailable")),
+        )
+        .with_login_method("Warp API");
+        if let Some(secondary) = secondary {
             usage = usage.with_secondary(secondary);
         }
 
         Ok(usage)
     }
 
-    fn primary_window(limit_info: &RequestLimitInfo) -> RateWindow {
-        let is_unlimited = limit_info.is_unlimited.unwrap_or(false);
-        let request_limit = limit_info.request_limit.unwrap_or(0);
-        let requests_used = limit_info.requests_used.unwrap_or(0);
-        let used_percent = Self::primary_used_percent(is_unlimited, requests_used, request_limit);
-        let reset_description = if is_unlimited {
-            "Unlimited".to_string()
-        } else {
-            format!("{requests_used}/{request_limit} credits")
-        };
-
-        let resets_at = (!is_unlimited)
-            .then(|| Self::parse_timestamp(limit_info.next_refresh_time.as_deref()))
-            .flatten();
-        RateWindow::with_details(used_percent, None, resets_at, Some(reset_description))
-    }
-
-    fn primary_used_percent(is_unlimited: bool, requests_used: i64, request_limit: i64) -> f64 {
-        if is_unlimited || request_limit <= 0 {
-            return 0.0;
+    fn primary_window(limit_info: &RequestLimitInfo) -> Option<RateWindow> {
+        if limit_info.is_unlimited == Some(true) {
+            return Some(RateWindow::informational("Unlimited"));
         }
-
-        ((requests_used as f64) / (request_limit as f64) * 100.0).clamp(0.0, 100.0)
+        let request_limit = limit_info.request_limit.filter(|limit| *limit > 0)?;
+        let requests_used = limit_info.requests_used?;
+        let used_percent =
+            ((requests_used as f64) / (request_limit as f64) * 100.0).clamp(0.0, 100.0);
+        Some(RateWindow::with_details(
+            used_percent,
+            None,
+            Self::parse_timestamp(limit_info.next_refresh_time.as_deref()),
+            Some(format!("{requests_used}/{request_limit} credits")),
+        ))
     }
 
     fn all_bonus_grants<'a>(
@@ -335,9 +331,10 @@ impl WarpProvider {
         let mut next_expiration: Option<(DateTime<Utc>, i64)> = None;
 
         for grant in all_grants {
-            let remaining = grant.request_credits_remaining.unwrap_or(0);
+            let remaining = grant.request_credits_remaining?;
+            let granted = grant.request_credits_granted?;
             bonus_remaining = bonus_remaining.saturating_add(remaining);
-            bonus_total = bonus_total.saturating_add(grant.request_credits_granted.unwrap_or(0));
+            bonus_total = bonus_total.saturating_add(granted);
 
             if remaining > 0
                 && let Some(expiration) = Self::parse_timestamp(grant.expiration.as_deref())
@@ -356,7 +353,7 @@ impl WarpProvider {
             }
         }
 
-        if bonus_total <= 0 && bonus_remaining <= 0 {
+        if bonus_total <= 0 {
             return None;
         }
 
@@ -441,15 +438,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn primary_usage_is_zero_for_unlimited_accounts() {
-        assert_eq!(WarpProvider::primary_used_percent(true, 75, 100), 0.0);
-    }
-
-    #[test]
     fn primary_usage_clamps_to_percent_range() {
-        assert_eq!(WarpProvider::primary_used_percent(false, 25, 100), 25.0);
-        assert_eq!(WarpProvider::primary_used_percent(false, 150, 100), 100.0);
-        assert_eq!(WarpProvider::primary_used_percent(false, 25, 0), 0.0);
+        for (used, expected) in [(25, 25.0), (150, 100.0), (-25, 0.0)] {
+            let window = WarpProvider::primary_window(&RequestLimitInfo {
+                is_unlimited: Some(false),
+                next_refresh_time: None,
+                request_limit: Some(100),
+                requests_used: Some(used),
+            })
+            .unwrap();
+            assert_eq!(window.used_percent, expected);
+        }
     }
 
     #[test]
@@ -488,7 +487,8 @@ mod tests {
             next_refresh_time: Some("2026-09-20T12:34:56Z".to_string()),
             request_limit: Some(100),
             requests_used: Some(25),
-        });
+        })
+        .expect("quota");
 
         assert_eq!(window.used_percent, 25.0);
         assert_eq!(
@@ -523,5 +523,86 @@ mod tests {
             window.reset_description.as_deref(),
             Some("20 credits expire on 2026-09-22 00:00 UTC")
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289a_parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> Result<UsageSnapshot, ProviderError> {
+        WarpProvider::build_usage_snapshot(serde_json::from_value(value).unwrap())
+    }
+    #[test]
+    fn review16_unlimited_with_counters_is_information() {
+        let snapshot = parse(json!({"requestLimitInfo":{
+            "isUnlimited":true,"requestLimit":100,"requestsUsedSinceLastRefresh":25
+        }}))
+        .unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("Unlimited")
+        );
+        assert_eq!(snapshot.primary.resets_at, None);
+    }
+
+    #[test]
+    fn review16_unlimited_without_counters_keeps_bonus_quota() {
+        let snapshot = parse(json!({"requestLimitInfo":{"isUnlimited":true},
+            "bonusGrants":[{"requestCreditsGranted":100,"requestCreditsRemaining":75}]
+        }))
+        .unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("Unlimited")
+        );
+        let bonus = snapshot.secondary.unwrap();
+        assert!(!bonus.is_informational);
+        assert_eq!(bonus.used_percent, 25.0);
+        assert!(
+            parse(json!({"requestLimitInfo":{"isUnlimited":true}}))
+                .unwrap()
+                .primary
+                .is_informational
+        );
+    }
+
+    #[test]
+    fn missing_usage_is_an_error() {
+        for value in [
+            json!({"requestLimitInfo":{}}),
+            json!({"requestLimitInfo":{"requestLimit":100}}),
+            json!({"requestLimitInfo":{"requestsUsedSinceLastRefresh":0}}),
+        ] {
+            assert!(parse(value.clone()).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = parse(
+            json!({"requestLimitInfo":{"requestLimit":100,"requestsUsedSinceLastRefresh":0}}),
+        )
+        .unwrap();
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
+    }
+    #[test]
+    fn incomplete_bonus_is_not_a_quota() {
+        for bonus in [
+            json!({"requestCreditsGranted":100}),
+            json!({"requestCreditsRemaining":100}),
+        ] {
+            let snapshot = parse(json!({"requestLimitInfo":{"requestLimit":100,"requestsUsedSinceLastRefresh":0},"bonusGrants":[bonus]})).unwrap();
+            assert!(snapshot.secondary.is_none());
+        }
+    }
+    #[test]
+    fn bonus_only_keeps_primary_unavailable() {
+        let snapshot = parse(json!({"requestLimitInfo":{},"bonusGrants":[{"requestCreditsGranted":100,"requestCreditsRemaining":100}]})).unwrap();
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(snapshot.secondary.unwrap().used_percent, 0.0);
     }
 }

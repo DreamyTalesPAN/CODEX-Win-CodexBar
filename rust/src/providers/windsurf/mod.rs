@@ -121,7 +121,7 @@ impl WindsurfProvider {
             .map_err(|e| ProviderError::Parse(format!("Failed to parse Windsurf plan cache: {e}")))
     }
 
-    fn snapshot_from_plan(plan: CachedPlanInfo) -> UsageSnapshot {
+    fn snapshot_from_plan(plan: CachedPlanInfo) -> Result<UsageSnapshot, ProviderError> {
         let mut primary = None;
         let mut secondary = None;
 
@@ -171,19 +171,22 @@ impl WindsurfProvider {
                 if had_primary {
                     snapshot = snapshot.with_extra_rate_window("flex", "Flex Credits", flex);
                 }
-                return with_identity(snapshot, plan.plan_name, plan.end_timestamp);
+                return Ok(with_identity(snapshot, plan.plan_name, plan.end_timestamp));
             }
         }
 
+        if primary.is_none() && secondary.is_none() {
+            return Err(ProviderError::Parse(
+                "Windsurf plan cache has no quota details".to_string(),
+            ));
+        }
         let mut snapshot = UsageSnapshot::new(primary.unwrap_or_else(|| {
-            let mut window = RateWindow::new(0.0);
-            window.reset_description = Some("No cached Windsurf quota details".to_string());
-            window
+            RateWindow::informational("No cached Windsurf daily quota details")
         }));
         if let Some(secondary) = secondary {
             snapshot = snapshot.with_secondary(secondary);
         }
-        with_identity(snapshot, plan.plan_name, plan.end_timestamp)
+        Ok(with_identity(snapshot, plan.plan_name, plan.end_timestamp))
     }
 }
 
@@ -213,7 +216,7 @@ impl Provider for WindsurfProvider {
                 })?;
                 let plan = Self::read_cached_plan(path)?;
                 Ok(ProviderFetchResult::new(
-                    Self::snapshot_from_plan(plan),
+                    Self::snapshot_from_plan(plan)?,
                     "local cache",
                 ))
             }
@@ -326,7 +329,8 @@ mod tests {
                 daily_reset_at_unix: None,
                 weekly_reset_at_unix: None,
             }),
-        });
+        })
+        .expect("snapshot");
 
         assert_eq!(snapshot.primary.used_percent, 20.0);
         assert_eq!(
@@ -372,5 +376,56 @@ mod tests {
         let window = usage_window(Some(5), Some(5), Some(10), "messages").unwrap();
 
         assert_eq!(window.reset_description.as_deref(), Some("5 / 10 messages"));
+    }
+}
+
+#[cfg(test)]
+mod missing_usage_tests {
+    use super::*;
+
+    fn plan(usage: Option<WindsurfUsage>, quota_usage: Option<QuotaUsage>) -> CachedPlanInfo {
+        CachedPlanInfo {
+            plan_name: Some("Pro".into()),
+            end_timestamp: None,
+            usage,
+            quota_usage,
+        }
+    }
+
+    #[test]
+    fn plan_without_a_quota_is_an_error_not_zero_percent() {
+        assert!(WindsurfProvider::snapshot_from_plan(plan(None, None)).is_err());
+    }
+
+    #[test]
+    fn weekly_only_plan_keeps_daily_unavailable() {
+        let snapshot = WindsurfProvider::snapshot_from_plan(plan(
+            None,
+            Some(QuotaUsage {
+                daily_remaining_percent: None,
+                weekly_remaining_percent: Some(25.0),
+                daily_reset_at_unix: None,
+                weekly_reset_at_unix: None,
+            }),
+        ))
+        .expect("snapshot");
+        assert!(snapshot.primary.is_informational);
+        assert_eq!(snapshot.secondary.map(|w| w.used_percent), Some(75.0));
+    }
+
+    #[test]
+    fn real_zero_usage_stays_a_quota() {
+        let snapshot = WindsurfProvider::snapshot_from_plan(plan(
+            None,
+            Some(QuotaUsage {
+                daily_remaining_percent: Some(100.0),
+                weekly_remaining_percent: None,
+                daily_reset_at_unix: None,
+                weekly_reset_at_unix: None,
+            }),
+        ))
+        .expect("snapshot");
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(snapshot.primary.used_percent, 0.0);
     }
 }

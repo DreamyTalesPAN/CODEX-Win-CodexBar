@@ -63,6 +63,9 @@ pub struct TtyCommandOptions {
     pub send_enter_every_secs: Option<f64>,
     /// Map of substrings to keys to send when detected
     pub send_on_substrings: HashMap<String, String>,
+    /// How long a trigger must be visible before its keys are sent. Dialogs
+    /// that ignore keys right after they open need this (default: 0s).
+    pub send_trigger_delay_secs: f64,
     /// Stop early when a URL is detected
     pub stop_on_url: bool,
     /// Stop early when any of these substrings are detected
@@ -101,6 +104,7 @@ impl Default for TtyCommandOptions {
             script_line_delay_secs: 0.0,
             send_enter_every_secs: None,
             send_on_substrings: HashMap::new(),
+            send_trigger_delay_secs: 0.0,
             stop_on_url: false,
             stop_on_substrings: Vec::new(),
             settle_after_stop_secs: 0.25,
@@ -192,6 +196,11 @@ impl TtyCommandOptions {
         keys: impl Into<String>,
     ) -> Self {
         self.send_on_substrings.insert(trigger.into(), keys.into());
+        self
+    }
+
+    pub fn with_send_trigger_delay(mut self, secs: f64) -> Self {
+        self.send_trigger_delay_secs = secs;
         self
     }
 }
@@ -361,6 +370,7 @@ impl TtyCommandRunner {
         let mut detected_urls = Vec::new();
         let mut last_output_time = Instant::now();
         let mut triggered_sends = std::collections::HashSet::new();
+        let mut trigger_seen_at: HashMap<String, Instant> = HashMap::new();
 
         // URL detection regex
         let url_regex = Regex::new(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+").ok();
@@ -546,23 +556,22 @@ impl TtyCommandRunner {
                         break;
                     }
                 }
-
-                // Check for send triggers
-                for (trigger, keys) in &options.send_on_substrings {
-                    if !triggered_sends.contains(trigger) && buffer.contains(trigger) {
-                        let normalized = keys.replace('\n', "\r\n");
-                        // Best-effort send-trigger input; a closed PTY drops the write.
-                        let _trigger_written = write!(writer, "{}", normalized);
-                        // Best-effort flush after a send-trigger write.
-                        let _trigger_flushed = writer.flush();
-                        triggered_sends.insert(trigger.clone());
-                    }
-                }
             }
 
             if stopped_early {
                 break;
             }
+
+            // Checked on every pass, not only when a chunk arrives: a dialog
+            // that is already on screen (also from the initial delay) prints
+            // nothing more while it waits for its answer.
+            fire_send_triggers(
+                &buffer,
+                options,
+                &mut triggered_sends,
+                &mut trigger_seen_at,
+                &mut writer,
+            );
 
             // Re-send the script while the target program has not shown that it
             // accepted the first attempt (input widget mounted late).
@@ -749,6 +758,36 @@ fn write_script_lines(
     write_script_lines_impl(writer, script_lines, options)
 }
 
+/// Send the keys of every trigger that has been visible in `buffer` for at
+/// least `send_trigger_delay_secs` and has not fired yet. Each trigger fires
+/// at most once per session.
+fn fire_send_triggers(
+    buffer: &str,
+    options: &TtyCommandOptions,
+    triggered_sends: &mut std::collections::HashSet<String>,
+    trigger_seen_at: &mut HashMap<String, Instant>,
+    writer: &mut Box<dyn Write + Send>,
+) {
+    let delay = Duration::from_secs_f64(options.send_trigger_delay_secs);
+    for (trigger, keys) in &options.send_on_substrings {
+        if triggered_sends.contains(trigger) || !buffer.contains(trigger) {
+            continue;
+        }
+        let seen_at = *trigger_seen_at
+            .entry(trigger.clone())
+            .or_insert_with(Instant::now);
+        if seen_at.elapsed() >= delay {
+            let normalized = keys.replace('\n', "\r\n");
+            tracing::trace!(trigger = %trigger, "tty session: send trigger fired");
+            // Best-effort send-trigger input; a closed PTY drops the write.
+            let _trigger_written = write!(writer, "{}", normalized);
+            // Best-effort flush after a send-trigger write.
+            let _trigger_flushed = writer.flush();
+            triggered_sends.insert(trigger.clone());
+        }
+    }
+}
+
 /// Kill a process and all of its descendants (best effort, Windows only).
 #[cfg(windows)]
 fn kill_process_tree(pid: u32) {
@@ -849,6 +888,42 @@ mod tests {
         assert_eq!(opts.idle_timeout_secs, Some(5.0));
         assert!(opts.stop_on_url);
         assert!(opts.stop_on_substrings.contains(&"error".to_string()));
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn send_trigger_waits_for_delay_and_fires_once() {
+        let opts = TtyCommandOptions::new()
+            .with_send_on_substring("Trust?", "\x1b[B\r")
+            .with_send_trigger_delay(0.2);
+        let sent = SharedWriter::default();
+        let mut writer: Box<dyn Write + Send> = Box::new(sent.clone());
+        let mut fired = std::collections::HashSet::new();
+        let mut seen_at = HashMap::new();
+
+        fire_send_triggers("loading", &opts, &mut fired, &mut seen_at, &mut writer);
+        fire_send_triggers("Trust?", &opts, &mut fired, &mut seen_at, &mut writer);
+        assert!(
+            sent.0.lock().unwrap().is_empty(),
+            "answered before the delay"
+        );
+
+        std::thread::sleep(Duration::from_millis(250));
+        fire_send_triggers("Trust?", &opts, &mut fired, &mut seen_at, &mut writer);
+        fire_send_triggers("Trust?", &opts, &mut fired, &mut seen_at, &mut writer);
+        assert_eq!(sent.0.lock().unwrap().as_slice(), b"\x1b[B\r");
     }
 
     #[test]

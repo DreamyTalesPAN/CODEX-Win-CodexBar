@@ -7,13 +7,14 @@ use reqwest::Client;
 use reqwest::header::{HeaderValue, RETRY_AFTER};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::{NamedRateWindow, ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot};
 
 mod credentials_store;
 mod refresh;
+mod usage_gate;
 
 pub(super) fn clear_account_cache(credential_path: &std::path::Path) {
     credentials_store::clear_cache();
@@ -154,12 +155,16 @@ pub(super) fn is_rate_limited_error(error: &ProviderError) -> bool {
     matches!(error, ProviderError::OAuth(message) if message.starts_with(RATE_LIMITED_PREFIX))
 }
 
+/// True when a Claude Code login is readable (environment token, credentials
+/// file or OS credential store), whether or not its access token is current.
+pub(super) fn has_stored_credentials() -> bool {
+    credentials_store::load_credentials().is_ok()
+}
+
 /// Claude OAuth fetcher
 pub struct ClaudeOAuthFetcher {
     client: Client,
 }
-
-static RATE_LIMIT_BACKOFF_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 // ── Refresh-token backoff (upstream 0.48.0 #2650) ────────────────────────────
 //
@@ -449,8 +454,20 @@ impl ClaudeOAuthFetcher {
             )));
         }
 
-        if let Some(remaining) = Self::rate_limit_backoff_remaining() {
-            return Err(Self::rate_limited_error(remaining));
+        let token = usage_gate::token_fingerprint(&credentials.access_token);
+        let now = Utc::now();
+        match usage_gate::decide(&usage_gate::load(), &token, now) {
+            usage_gate::Decision::Cached(body) => {
+                if let Ok(usage) = serde_json::from_str(&body) {
+                    return Ok(usage);
+                }
+            }
+            usage_gate::Decision::Blocked(until) => {
+                return Err(Self::rate_limited_error(
+                    (until - now).to_std().unwrap_or_default(),
+                ));
+            }
+            usage_gate::Decision::Fetch => {}
         }
 
         let response = self
@@ -500,8 +517,14 @@ impl ClaudeOAuthFetcher {
             }
 
             if status.as_u16() == 429 {
-                Self::record_rate_limit(retry_after);
-                return Err(Self::rate_limited_error(retry_after));
+                let now = Utc::now();
+                let blocked = usage_gate::after_rate_limit(&usage_gate::load(), retry_after, now);
+                usage_gate::store(&blocked);
+                let wait = blocked
+                    .blocked_until
+                    .and_then(|until| (until - now).to_std().ok())
+                    .unwrap_or(retry_after);
+                return Err(Self::rate_limited_error(wait));
             }
 
             return Err(ProviderError::OAuth(format!(
@@ -511,41 +534,15 @@ impl ClaudeOAuthFetcher {
             )));
         }
 
-        let usage: OAuthUsageResponse = response
-            .json()
+        let body = response
+            .text()
             .await
             .map_err(|e| ProviderError::Parse(format!("Failed to parse OAuth response: {}", e)))?;
+        let usage: OAuthUsageResponse = serde_json::from_str(&body)
+            .map_err(|e| ProviderError::Parse(format!("Failed to parse OAuth response: {}", e)))?;
 
-        Self::clear_rate_limit();
+        usage_gate::store(&usage_gate::after_success(&token, body, Utc::now()));
         Ok(usage)
-    }
-
-    fn rate_limit_gate() -> &'static Mutex<Option<Instant>> {
-        RATE_LIMIT_BACKOFF_UNTIL.get_or_init(|| Mutex::new(None))
-    }
-
-    fn rate_limit_backoff_remaining() -> Option<Duration> {
-        let mut guard = Self::rate_limit_gate().lock().ok()?;
-        let until = (*guard)?;
-        let now = Instant::now();
-        if until <= now {
-            *guard = None;
-            None
-        } else {
-            Some(until.saturating_duration_since(now))
-        }
-    }
-
-    fn record_rate_limit(duration: Duration) {
-        if let Ok(mut guard) = Self::rate_limit_gate().lock() {
-            *guard = Some(Instant::now() + duration);
-        }
-    }
-
-    fn clear_rate_limit() {
-        if let Ok(mut guard) = Self::rate_limit_gate().lock() {
-            *guard = None;
-        }
     }
 
     fn retry_after_duration(value: Option<&HeaderValue>) -> Duration {

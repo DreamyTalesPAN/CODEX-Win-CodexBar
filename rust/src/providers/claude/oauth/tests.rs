@@ -344,17 +344,6 @@ fn invalid_retry_after_uses_default_backoff() {
 }
 
 #[test]
-fn rate_limit_gate_blocks_and_clears() {
-    ClaudeOAuthFetcher::clear_rate_limit();
-
-    ClaudeOAuthFetcher::record_rate_limit(Duration::from_secs(30));
-    assert!(ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_some());
-
-    ClaudeOAuthFetcher::clear_rate_limit();
-    assert!(ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_none());
-}
-
-#[test]
 fn rate_limited_error_preserves_credentials_language() {
     let error = ClaudeOAuthFetcher::rate_limited_error(Duration::from_secs(5));
     let message = error.to_string();

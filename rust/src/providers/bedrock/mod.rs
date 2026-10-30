@@ -429,6 +429,29 @@ impl BedrockProvider {
         }
     }
 
+    fn spend_window(
+        spend: f64,
+        budget: Option<f64>,
+        resets_at: Option<chrono::DateTime<Utc>>,
+    ) -> RateWindow {
+        match budget {
+            Some(limit) if limit > 0.0 => RateWindow::with_details(
+                (spend / limit) * 100.0,
+                None,
+                resets_at,
+                Some("Monthly budget".to_string()),
+            ),
+            _ => RateWindow::informational(format!("Monthly spend ${spend:.2}")),
+        }
+    }
+
+    fn activity_window(activity: &BedrockClaudeActivity) -> RateWindow {
+        RateWindow::informational(format!(
+            "Claude 14d: {:.0} input, {:.0} output tokens, {:.0} requests",
+            activity.input_tokens, activity.output_tokens, activity.request_count
+        ))
+    }
+
     async fn fetch_via_api(
         &self,
         ctx: &FetchContext,
@@ -438,25 +461,7 @@ impl BedrockProvider {
         let spend = self.fetch_monthly_spend(&credentials).await?;
         let resets_at = end_of_current_month();
 
-        let used_percent = budget
-            .map(|limit| {
-                if limit > 0.0 {
-                    (spend / limit) * 100.0
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
-
-        let mut primary = RateWindow::with_details(
-            used_percent,
-            None,
-            resets_at,
-            budget.map(|_| "Monthly budget".to_string()),
-        );
-        if budget.is_none() {
-            primary.reset_description = Some(format!("Monthly spend ${spend:.2}"));
-        }
+        let primary = Self::spend_window(spend, budget, resets_at);
 
         let mut cost = CostSnapshot::new(spend, "USD", "Monthly");
         if let Some(limit) = budget {
@@ -482,11 +487,7 @@ impl BedrockProvider {
         if let Ok(activity) = self.fetch_claude_activity(&credentials, &region).await
             && activity.request_count > 0.0
         {
-            let mut window = RateWindow::new(0.0);
-            window.reset_description = Some(format!(
-                "Claude 14d: {:.0} input, {:.0} output tokens, {:.0} requests",
-                activity.input_tokens, activity.output_tokens, activity.request_count
-            ));
+            let window = Self::activity_window(&activity);
             usage = usage.with_extra_rate_window("claude-14d", "Claude 14d activity", window);
         }
         Ok(ProviderFetchResult::new(usage, "api").with_cost(cost))
@@ -909,5 +910,33 @@ mod tests {
             hex(&digest),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+}
+
+#[cfg(test)]
+mod cx289b_tests {
+    use super::*;
+    #[test]
+    fn spend_without_budget_is_informational() {
+        for spend in [0.0, 12.5] {
+            let window = BedrockProvider::spend_window(spend, None, end_of_current_month());
+            assert!(window.is_informational);
+            assert!(window.resets_at.is_none());
+        }
+    }
+    #[test]
+    fn activity_without_denominator_is_informational() {
+        let activity = BedrockClaudeActivity {
+            input_tokens: 10.0,
+            output_tokens: 20.0,
+            request_count: 1.0,
+        };
+        assert!(BedrockProvider::activity_window(&activity).is_informational);
+    }
+    #[test]
+    fn real_zero_spend_with_budget_stays_quota() {
+        let window = BedrockProvider::spend_window(0.0, Some(100.0), end_of_current_month());
+        assert!(!window.is_informational);
+        assert_eq!(window.used_percent, 0.0);
     }
 }
